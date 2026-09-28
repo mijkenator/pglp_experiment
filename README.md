@@ -63,6 +63,14 @@ on UPDATE/DELETE unless the table's `REPLICA IDENTITY` is set to `FULL`.)
    "
    ```
 
+   Or use `scripts/generate_events.sh` to continuously generate INSERT and
+   UPDATE events on `items`:
+
+   ```
+   ./scripts/generate_events.sh          # 10 insert+update cycles, 1s apart
+   ./scripts/generate_events.sh 50 0.2   # 50 cycles, 0.2s apart
+   ```
+
 ## Configuration
 
 Connection and replication settings are read from environment variables

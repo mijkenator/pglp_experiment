@@ -71,6 +71,13 @@ on UPDATE/DELETE unless the table's `REPLICA IDENTITY` is set to `FULL`.)
    ./scripts/generate_events.sh 50 0.2   # 50 cycles, 0.2s apart
    ```
 
+   Use `scripts/reset_items.sh` beforehand if you want to start Postgres
+   and get `items` into a clean, empty state (e.g. so ids start back at 1):
+
+   ```
+   ./scripts/reset_items.sh
+   ```
+
 ## Configuration
 
 Connection and replication settings are read from environment variables

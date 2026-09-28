@@ -78,6 +78,15 @@ on UPDATE/DELETE unless the table's `REPLICA IDENTITY` is set to `FULL`.)
    ./scripts/reset_items.sh
    ```
 
+4. When you're done, tear everything down. `docker compose stop` just stops
+   the container (data preserved, resume with `docker compose up -d`);
+   `docker compose down` also removes the container/network (data volume
+   preserved). To remove **everything**, including the database data, use:
+
+   ```
+   ./scripts/teardown.sh
+   ```
+
 ## Configuration
 
 Connection and replication settings are read from environment variables

@@ -31,6 +31,24 @@ Decoded changes are logged like:
 (Values that aren't part of the row's key/replica identity show up as `nil`
 on UPDATE/DELETE unless the table's `REPLICA IDENTITY` is set to `FULL`.)
 
+## Resuming after a crash (no missed events)
+
+If the app goes down mid-run, restarting it does **not** lose or skip
+events. Postgres logical replication slots always resume from the slot's
+own `confirmed_flush_lsn`, and the consumer only advances that position
+after fully processing a transaction (on each `Commit`, acked right away —
+not just on the server's ~10s keepalive). On reconnect it logs
+`Resuming replication from slot ... (confirmed_flush_lsn=...)`, and
+Postgres redelivers everything committed after that point — nothing more,
+nothing less.
+
+This makes delivery **at-least-once**: a transaction that was fully
+processed but whose ack hadn't reached Postgres yet before a crash may be
+redelivered once. For console logging that's harmless; a real downstream
+sink should dedupe on something like `{relation_oid, primary_key, xid}` if
+that matters. See the moduledoc on `PglpExperiment.Replication.Consumer`
+for the full explanation.
+
 ## Running it
 
 1. Start PostgreSQL (configured with `wal_level=logical`):

@@ -153,6 +153,65 @@ Inserts/updates/deletes on `items` in Postgres show up in RisingWave's
 `items` within a couple of seconds. The RisingWave dashboard is at
 <http://localhost:5691>.
 
+## RisingWave consumer (experimental second CDC path)
+
+The section above shows the Elixir app's `Consumer` reading from
+Postgres, with RisingWave as a second, independent CDC reader of the
+same database. This section is the *other* direction: the Elixir app
+consuming *from* RisingWave, via RisingWave's own
+[subscription cursor](https://docs.risingwave.com/delivery/subscription)
+feature (`CREATE SUBSCRIPTION` + `DECLARE ... SUBSCRIPTION CURSOR` +
+`FETCH NEXT ... WITH (timeout = ...)`).
+
+This can't use Postgrex — every Postgrex connection path unconditionally
+runs a `pg_type` bootstrap query that RisingWave's catalog can't satisfy
+(missing the `typsend` column it needs), which kills the connection
+before any real query runs. See the moduledoc on
+`PglpExperiment.RisingWave.Client` for the full explanation. Instead,
+`PglpExperiment.RisingWave.Client` is a small hand-rolled Postgres
+wire-protocol v3 client (`:gen_tcp`, zero extra deps) that skips that
+query entirely.
+
+`mix pglp.risingwave` automates the same `CREATE SOURCE`/`CREATE TABLE
+... FROM ...`/`CREATE SUBSCRIPTION` steps the section above walks
+through by hand, then streams the result:
+
+```
+docker compose up -d
+./scripts/reset_items.sh          # ensure the mirrored table exists on Postgres
+mix pglp.risingwave
+```
+
+In another shell, generate some changes and watch them appear:
+
+```
+./scripts/generate_events.sh 5 1
+```
+
+Expect log lines like:
+
+```
+[info] INSERT into items: %{"id" => "1", "name" => "item-1"}
+[info] UPDATE (delete half) on items: %{"id" => "1", "name" => "item-1"}
+[info] UPDATE (insert half) on items: %{"id" => "1", "name" => "item-1-updated"}
+```
+
+(An `UPDATE` emits two rows sharing the same `rw_timestamp` — the old
+row as `UpdateDelete`, the new row as `UpdateInsert` — rather than one
+combined row, unlike the Postgres `Consumer`'s single `UPDATE` line.)
+
+**Resume model — coarser than the Postgres consumer's.** Postgres
+tracks a durable `confirmed_flush_lsn` against the replication slot,
+so `Replication.Consumer` can resume exactly across a full process
+restart. RisingWave's subscription cursor has no equivalent — it's
+session-scoped and gone the moment the connection drops, so
+`RisingWave.Consumer` can only resume from the last `rw_timestamp` it
+personally remembers in memory. A mid-session reconnect (e.g. the
+container restarting) resumes tightly from that point; a full process
+restart falls back to `SINCE now()` (skip anything missed while down)
+by default. See the moduledoc on `PglpExperiment.RisingWave.Consumer`
+for the complete explanation.
+
 ## Performance testing
 
 `mix pglp.perf` measures how many replication events the consumer can
@@ -206,3 +265,29 @@ Connection and replication settings are read from environment variables
 | `PGPASSWORD`        | `postgres`             |
 | `PUBLICATION_NAME`  | `pglp_publication`     |
 | `SLOT_NAME`         | `pglp_slot`            |
+
+`mix pglp.risingwave` reads its own set (see `config/runtime.exs`,
+nested under `:risingwave`), split into "how this app reaches
+RisingWave" and "how RisingWave reaches Postgres" — genuinely different
+network hops (the app runs on the host, RisingWave runs inside
+docker-compose's network):
+
+| Env var                       | Default                    |
+|--------------------------------|-----------------------------|
+| `RW_HOST`                     | `localhost`                 |
+| `RW_PORT`                     | `4566`                      |
+| `RW_DATABASE`                 | `dev`                       |
+| `RW_USER`                     | `root`                      |
+| `RW_PASSWORD`                 | *(empty)*                   |
+| `RW_TABLE_NAME`                | `items`                     |
+| `RW_SUBSCRIPTION_NAME`         | `pglp_rw_subscription`      |
+| `RW_SOURCE_NAME`               | `pglp_pg_source`            |
+| `RW_RETENTION`                 | `1D`                        |
+| `RW_FETCH_TIMEOUT_SECONDS`     | `5`                         |
+| `RW_COLUMNS`                   | `id int primary key, name varchar, updated_at timestamptz` |
+| `RW_PG_HOSTNAME`               | `postgres`                  |
+| `RW_PG_PORT`                   | `5432`                      |
+| `RW_PG_USERNAME`               | `postgres`                  |
+| `RW_PG_PASSWORD`               | `postgres`                  |
+| `RW_PG_DATABASE`               | `pglp_dev`                  |
+| `RW_PG_TABLE`                  | `public.items`               |

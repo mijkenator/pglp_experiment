@@ -11,6 +11,7 @@ defmodule Mix.Tasks.Pglp.Perf do
       mix pglp.perf                  # 10_000 rows (10_000 inserts + 10_000 updates = 20_000 events)
       mix pglp.perf --rows 100_000
       mix pglp.perf --rows 50_000 --batch-size 1000
+      mix pglp.perf --rows 50_000 --ack-every-commit 10
 
   ## What it measures
 
@@ -28,6 +29,14 @@ defmodule Mix.Tasks.Pglp.Perf do
       with sustained throughput once the consumer can't fully keep up.
     * **Correctness** — confirms every generated row id was actually
       observed (no silently dropped events) before reporting numbers.
+
+  `--ack-every-commit N` (default `1`) controls how many commits the
+  consumer accumulates before proactively acknowledging them back to
+  Postgres — see the `:ack_every_commit` option on
+  `PglpExperiment.Replication.Consumer.start_link/1`. Raising it reduces
+  the number of standby status updates sent, at the cost of a larger
+  post-crash redelivery window; use this to explore that tradeoff under
+  load.
 
   Uses its own dedicated publication/slot (`pglp_perf_publication` /
   `pglp_perf_slot`) and table (`pglp_perf_items`), separate from your
@@ -62,12 +71,13 @@ defmodule Mix.Tasks.Pglp.Perf do
 
     {opts, _} =
       OptionParser.parse!(args,
-        strict: [rows: :integer, batch_size: :integer],
-        aliases: [r: :rows, b: :batch_size]
+        strict: [rows: :integer, batch_size: :integer, ack_every_commit: :integer],
+        aliases: [r: :rows, b: :batch_size, a: :ack_every_commit]
       )
 
     row_count = opts[:rows] || 10_000
     batch_size = opts[:batch_size] || 500
+    ack_every_commit = opts[:ack_every_commit] || 1
 
     connection_opts = [
       hostname: Application.fetch_env!(:pglp_experiment, :hostname),
@@ -80,7 +90,8 @@ defmodule Mix.Tasks.Pglp.Perf do
     try do
       Mix.shell().info(
         "Preparing perf run: #{row_count} rows (#{row_count} inserts + #{row_count} updates = " <>
-          "#{row_count * 2} expected events), batch size #{batch_size}"
+          "#{row_count * 2} expected events), batch size #{batch_size}, " <>
+          "ack every #{ack_every_commit} commit(s)"
       )
 
       {:ok, setup_conn} = Postgrex.start_link(connection_opts)
@@ -93,7 +104,13 @@ defmodule Mix.Tasks.Pglp.Perf do
       {:ok, _consumer} =
         Consumer.start_link(
           connection_opts ++
-            [publication_name: @publication, slot_name: @slot, quiet: true, name: @consumer_name]
+            [
+              publication_name: @publication,
+              slot_name: @slot,
+              quiet: true,
+              name: @consumer_name,
+              ack_every_commit: ack_every_commit
+            ]
         )
 
       Mix.shell().info("Consumer connected, generating load...")
@@ -159,7 +176,7 @@ defmodule Mix.Tasks.Pglp.Perf do
   end
 
   defp report(row_count, expected_events) do
-    %{changes: changes, by_type: by_type, lags_us: lags_us} = Collector.snapshot()
+    %{changes: changes, by_type: by_type, lags_us: lags_us, acks: acks} = Collector.snapshot()
 
     duration_us = consumption_duration_us()
     events_per_sec = if duration_us > 0, do: changes / (duration_us / 1_000_000), else: 0.0
@@ -169,6 +186,7 @@ defmodule Mix.Tasks.Pglp.Perf do
     Mix.shell().info("By type:           #{inspect(by_type)}")
     Mix.shell().info("Consumption time:  #{format_us(duration_us)}")
     Mix.shell().info("Throughput:        #{Float.round(events_per_sec, 1)} events/sec")
+    Mix.shell().info("Acks sent:         #{acks} (for #{length(lags_us)} commits)")
 
     report_lag(lags_us)
 

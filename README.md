@@ -116,22 +116,31 @@ events):
 
 ```
 docker compose up -d
-mix pglp.perf                          # 10,000 rows -> 20,000 events
-mix pglp.perf --rows 100000             # scale up
+mix pglp.perf                                    # 10,000 rows -> 20,000 events
+mix pglp.perf --rows 100000                       # scale up
 mix pglp.perf --rows 50000 --batch-size 1000
+mix pglp.perf --rows 50000 --ack-every-commit 10  # ack every 10th commit instead of every one
 ```
 
 Sample output:
 
 ```
 == Results ==
-Events received:   20000 / 20000
-By type:           %{insert: 10000, update: 10000}
-Consumption time:  453.4ms
-Throughput:        44111.3 events/sec
-Replication lag:   min=-6588µs mean=98.1ms p95=159.0ms max=161.6ms (n=40 commits)
-Correctness:       OK, all 10000 row ids observed, no gaps
+Events received:   40000 / 40000
+By type:           %{insert: 20000, update: 20000}
+Consumption time:  722.6ms
+Throughput:        55359.0 events/sec
+Acks sent:         80 (for 80 commits)
+Replication lag:   min=-6120µs mean=4.5ms p95=14.3ms max=19.2ms (n=80 commits)
+Correctness:       OK, all 20000 row ids observed, no gaps
 ```
+
+`--ack-every-commit N` (default `1`) controls how many commits the
+consumer batches before proactively acknowledging them back to Postgres.
+Raising it sends fewer acks (`Acks sent` above drops accordingly) at the
+cost of a larger post-crash redelivery window — up to `N - 1` already
+fully-processed commits could be replayed after a crash before the next
+ack would have gone out.
 
 See `mix help pglp.perf` for details on what's measured and how.
 

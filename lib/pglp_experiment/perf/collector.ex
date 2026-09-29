@@ -12,6 +12,7 @@ defmodule PglpExperiment.Perf.Collector do
 
   @change_event [:pglp_experiment, :replication, :change]
   @commit_event [:pglp_experiment, :replication, :commit]
+  @ack_event [:pglp_experiment, :replication, :ack]
 
   def start_link(_opts \\ []) do
     Agent.start_link(
@@ -21,6 +22,7 @@ defmodule PglpExperiment.Perf.Collector do
           by_type: %{},
           ids_seen: MapSet.new(),
           lags_us: [],
+          acks: 0,
           first_change_at: nil,
           last_change_at: nil
         }
@@ -33,7 +35,7 @@ defmodule PglpExperiment.Perf.Collector do
   def attach! do
     :telemetry.attach_many(
       "pglp-perf-collector",
-      [@change_event, @commit_event],
+      [@change_event, @commit_event, @ack_event],
       &__MODULE__.handle_event/4,
       nil
     )
@@ -63,6 +65,10 @@ defmodule PglpExperiment.Perf.Collector do
     Agent.update(__MODULE__, fn state ->
       Map.update!(state, :lags_us, &[lag_us | &1])
     end)
+  end
+
+  def handle_event(@ack_event, _measurements, _meta, _config) do
+    Agent.update(__MODULE__, fn state -> Map.update!(state, :acks, &(&1 + 1)) end)
   end
 
   defp record_id(state, %{row: %{"id" => id}}) when is_binary(id) do

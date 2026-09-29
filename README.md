@@ -200,17 +200,26 @@ Expect log lines like:
 row as `UpdateDelete`, the new row as `UpdateInsert` — rather than one
 combined row, unlike the Postgres `Consumer`'s single `UPDATE` line.)
 
-**Resume model — coarser than the Postgres consumer's.** Postgres
-tracks a durable `confirmed_flush_lsn` against the replication slot,
-so `Replication.Consumer` can resume exactly across a full process
-restart. RisingWave's subscription cursor has no equivalent — it's
-session-scoped and gone the moment the connection drops, so
-`RisingWave.Consumer` can only resume from the last `rw_timestamp` it
-personally remembers in memory. A mid-session reconnect (e.g. the
-container restarting) resumes tightly from that point; a full process
-restart falls back to `SINCE now()` (skip anything missed while down)
-by default. See the moduledoc on `PglpExperiment.RisingWave.Consumer`
-for the complete explanation.
+**Resume model — coarser than the Postgres consumer's, but restarting
+mid-run does not lose events.** Postgres tracks a durable
+`confirmed_flush_lsn` against the replication slot, so
+`Replication.Consumer` can resume exactly across a full process
+restart. RisingWave's subscription cursor has no server-side
+equivalent — it's session-scoped and gone the moment the connection
+drops — so `RisingWave.Consumer` checkpoints the last `rw_timestamp` it
+processed to a local file (`tmp/rising_wave_checkpoints/`) after every
+row, and reads it back on the next start. A mid-session reconnect
+(e.g. the container restarting) resumes from its in-memory position; a
+full process restart (e.g. restarting `mix pglp.risingwave` itself)
+resumes from that checkpoint file instead — so restarting while
+`scripts/generate_events.sh` is still running does **not** skip
+whatever happened while it was down. Only a first-ever run (no
+checkpoint file yet), or a checkpoint that's aged out of the
+subscription's `retention` window (RisingWave rejects the `DECLARE`
+outright in that case — logged as a warning, with a fallback to
+`SINCE now()`), fall back to the configured `:since` default. See the
+moduledoc on `PglpExperiment.RisingWave.Consumer` for the complete
+explanation.
 
 ## Performance testing
 

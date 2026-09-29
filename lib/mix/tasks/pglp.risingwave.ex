@@ -27,6 +27,17 @@ defmodule Mix.Tasks.Pglp.Risingwave do
       `./scripts/reset_items.sh` or `./scripts/generate_events.sh`
       first if starting fresh.
 
+  ## Restarting mid-run
+
+  Restarting this task while events are still being generated does
+  **not** lose them: `PglpExperiment.RisingWave.Consumer` checkpoints
+  its resume position to `tmp/rising_wave_checkpoints/` after every
+  processed row, and reads it back on the next start. See the
+  `Consumer` moduledoc for the full explanation (and its limits — a
+  checkpoint that has aged out of the subscription's `retention` window
+  falls back to `SINCE now()`, logging a warning that a gap is
+  possible).
+
   ## Why not wired into `mix run`?
 
   Kept as a standalone task, same pattern as `mix pglp.perf`: the main

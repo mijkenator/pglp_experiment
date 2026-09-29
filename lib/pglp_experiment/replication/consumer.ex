@@ -225,7 +225,7 @@ defmodule PglpExperiment.Replication.Consumer do
   # Postgres. This is what makes restarts resume without gaps: we never
   # tell the server we've flushed a transaction we haven't fully applied.
   defp handle_message(%{type: :commit} = msg, state) do
-    Logger.debug("Committed transaction, advancing confirmed LSN to #{msg.end_lsn}")
+    # Logger.debug("Committed transaction, advancing confirmed LSN to #{msg.end_lsn}")
 
     :telemetry.execute(
       [:pglp_experiment, :replication, :commit],

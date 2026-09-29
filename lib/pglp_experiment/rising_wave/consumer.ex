@@ -17,18 +17,30 @@ defmodule PglpExperiment.RisingWave.Consumer do
   no equivalent: nothing is ever acked back to the server, and the
   cursor itself is session-scoped — gone the moment the TCP connection
   drops. The only position this consumer can resume from is the
-  `rw_timestamp` of the last row *it* saw, held in this GenServer's own
-  memory:
+  `rw_timestamp` of the last row *it* saw:
 
     * A **mid-session TCP reconnect** (socket dropped, process alive)
-      resumes from `SINCE <last_seen_rw_timestamp>` — as tight a resume
-      as RisingWave's model supports, gated by the subscription's
-      `retention` window still covering that timestamp.
-    * A **full process restart** (state lost) has nothing to resume
-      from and falls back to the configured `:since` starting option
-      (default `"now()"` — skip anything missed while down; use
+      resumes from `state.last_seen_rw_timestamp` (in memory) — as
+      tight a resume as RisingWave's model supports, gated by the
+      subscription's `retention` window still covering that timestamp.
+    * A **full process restart** (in-memory state lost) resumes from a
+      checkpoint written to disk after every processed row (see
+      `PglpExperiment.RisingWave.Checkpoint`) — this is what closes the
+      gap where restarting mid-run would otherwise silently skip
+      everything produced while the process was down. Only if no
+      checkpoint file exists yet (first ever run) does it fall back to
+      the configured `:since` starting option (default `"now()"`; use
       `"begin()"` to replay everything still in the retention window
       instead).
+
+  If the checkpointed (or otherwise resumed-from) timestamp has aged out
+  of the subscription's `retention` window, RisingWave rejects the
+  `DECLARE` outright (confirmed live: `rw_timestamp is too small, need
+  to be large than the current unix_millis - subscription's retention
+  time`) rather than silently clamping or dropping data. This consumer
+  detects that specific error and falls back to `SINCE now()` for that
+  reconnect, logging a warning that a gap is possible — better to state
+  the gap plainly than to loop forever retrying a doomed timestamp.
 
   `SINCE ts` was confirmed (by hand, against a running container) to be
   **inclusive** — it redelivers the exact row at that timestamp — so a
@@ -44,6 +56,11 @@ defmodule PglpExperiment.RisingWave.Consumer do
   This is a deliberately coarser guarantee than the Postgres side
   provides — not a bug to fix, but a real limitation of RisingWave's
   subscription model that this design does not attempt to paper over.
+  The disk checkpoint narrows the gap (a full restart now resumes
+  almost as tightly as a mid-session reconnect) without pretending to
+  eliminate it — a checkpoint write can itself be lost between "row
+  processed" and "checkpoint fsync'd" on a hard crash, same as any
+  asynchronous ack.
 
   ## Telemetry
 
@@ -68,7 +85,13 @@ defmodule PglpExperiment.RisingWave.Consumer do
   use GenServer
   require Logger
 
-  alias PglpExperiment.RisingWave.{Client, Setup}
+  alias PglpExperiment.RisingWave.{Checkpoint, Client, Setup}
+
+  # RisingWave's own error for a DECLARE whose SINCE timestamp has aged
+  # out of the subscription's retention window (confirmed live: "rw_timestamp
+  # is too small, need to be large than the current unix_millis -
+  # subscription's retention time").
+  @retention_exceeded_pattern "rw_timestamp is too small"
 
   @default_cursor_name "pglp_rw_cursor"
   @default_fetch_timeout_seconds 5
@@ -89,23 +112,31 @@ defmodule PglpExperiment.RisingWave.Consumer do
       subscribe to.
     * `:cursor_name` — default `#{inspect(@default_cursor_name)}`.
     * `:fetch_timeout_seconds` — default `#{@default_fetch_timeout_seconds}`.
-    * `:since` — starting point for a fresh cursor: `"now()"` (default),
-      `"begin()"`, or an integer Unix-ms literal.
+    * `:since` — starting point for a fresh cursor when there's no
+      checkpoint to resume from yet (first ever run): `"now()"`
+      (default), `"begin()"`, or an integer Unix-ms literal.
     * `:setup_opts` — if given, passed to `Setup.ensure!/1` before the
       first connect (omit to skip auto-setup, e.g. if it's already been
       run separately).
     * `:quiet` — default `false`; skips the per-row `Logger.info/1` call.
     * `:name` — registers the process under that name.
     * `:reconnect_backoff_ms` — default `#{@default_reconnect_backoff_ms}`.
+    * `:checkpoint_dir` — directory for the on-disk resume checkpoint
+      (see `PglpExperiment.RisingWave.Checkpoint`); defaults to
+      `Checkpoint`'s own default. Pass `false` to disable checkpointing
+      entirely (every restart then falls back to `:since`).
   """
   def start_link(opts) do
     {name, opts} = Keyword.pop(opts, :name)
     gen_server_opts = if name, do: [name: name], else: []
 
+    subscription_name = Keyword.fetch!(opts, :subscription_name)
+    checkpoint_dir = Keyword.get(opts, :checkpoint_dir)
+
     state = %{
       connection_opts: Keyword.take(opts, [:hostname, :port, :database, :username, :password]),
       table_name: Keyword.fetch!(opts, :table_name),
-      subscription_name: Keyword.fetch!(opts, :subscription_name),
+      subscription_name: subscription_name,
       cursor_name: Keyword.get(opts, :cursor_name, @default_cursor_name),
       fetch_timeout_seconds:
         Keyword.get(opts, :fetch_timeout_seconds, @default_fetch_timeout_seconds),
@@ -114,12 +145,19 @@ defmodule PglpExperiment.RisingWave.Consumer do
       quiet?: Keyword.get(opts, :quiet, false),
       reconnect_backoff_ms:
         Keyword.get(opts, :reconnect_backoff_ms, @default_reconnect_backoff_ms),
+      checkpoint_dir: checkpoint_dir,
       socket: nil,
-      last_seen_rw_timestamp: nil
+      last_seen_rw_timestamp: load_checkpoint(subscription_name, checkpoint_dir)
     }
 
     GenServer.start_link(__MODULE__, state, gen_server_opts)
   end
+
+  defp load_checkpoint(_subscription_name, false), do: nil
+
+  defp load_checkpoint(subscription_name, nil), do: Checkpoint.read(subscription_name)
+
+  defp load_checkpoint(subscription_name, dir), do: Checkpoint.read(subscription_name, dir)
 
   @impl true
   def init(state), do: {:ok, state, {:continue, :connect}}
@@ -128,7 +166,7 @@ defmodule PglpExperiment.RisingWave.Consumer do
   def handle_continue(:connect, state) do
     with :ok <- maybe_run_setup(state),
          {:ok, socket} <- Client.connect(state.connection_opts),
-         {:ok, _} <- declare_cursor(socket, state) do
+         {:ok, state} <- declare_cursor_with_retention_fallback(socket, state) do
       Logger.info(
         "Connected to RisingWave, streaming subscription #{inspect(state.subscription_name)} " <>
           "(#{since_description(state)})"
@@ -187,6 +225,48 @@ defmodule PglpExperiment.RisingWave.Consumer do
     :ok
   end
 
+  # If we're resuming from a checkpointed/remembered timestamp that has
+  # since aged out of the subscription's retention window, RisingWave
+  # rejects the DECLARE outright (rather than silently clamping). Rather
+  # than loop forever retrying a doomed timestamp, fall back to `:since`
+  # once and log plainly that a gap is possible.
+  defp declare_cursor_with_retention_fallback(socket, %{last_seen_rw_timestamp: ts} = state)
+       when is_integer(ts) do
+    case declare_cursor(socket, state) do
+      {:ok, _} ->
+        {:ok, state}
+
+      {:error, %{message: message}} when is_binary(message) ->
+        if String.contains?(message, @retention_exceeded_pattern) do
+          Logger.warning(
+            "Checkpointed rw_timestamp=#{ts} for subscription " <>
+              "#{inspect(state.subscription_name)} has aged out of the retention window " <>
+              "(events committed between then and now for this consumer may have been " <>
+              "missed) — falling back to SINCE #{state.since}"
+          )
+
+          fallback_state = %{state | last_seen_rw_timestamp: nil}
+
+          case declare_cursor(socket, fallback_state) do
+            {:ok, _} -> {:ok, fallback_state}
+            {:error, reason} -> {:error, reason}
+          end
+        else
+          {:error, %{message: message}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp declare_cursor_with_retention_fallback(socket, state) do
+    case declare_cursor(socket, state) do
+      {:ok, _} -> {:ok, state}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp maybe_run_setup(%{setup_opts: nil}), do: :ok
 
   defp maybe_run_setup(%{setup_opts: setup_opts}) do
@@ -233,8 +313,18 @@ defmodule PglpExperiment.RisingWave.Consumer do
       }
     )
 
+    checkpoint!(state.subscription_name, rw_timestamp, state.checkpoint_dir)
+
     %{state | last_seen_rw_timestamp: rw_timestamp}
   end
+
+  defp checkpoint!(_subscription_name, _rw_timestamp, false), do: :ok
+
+  defp checkpoint!(subscription_name, rw_timestamp, nil),
+    do: Checkpoint.write!(subscription_name, rw_timestamp)
+
+  defp checkpoint!(subscription_name, rw_timestamp, dir),
+    do: Checkpoint.write!(subscription_name, rw_timestamp, dir)
 
   defp decode_op("Insert"), do: :insert
   defp decode_op("UpdateDelete"), do: :update_delete

@@ -105,6 +105,54 @@ for the full explanation.
    ./scripts/teardown.sh
    ```
 
+## RisingWave (optional, for comparing against a real CDC consumer)
+
+`docker-compose.yml` also includes a single-node
+[RisingWave](https://risingwave.com) container — a streaming database
+with a built-in Postgres CDC connector — so you can compare a
+production-grade logical replication consumer against this repo's
+hand-rolled `Consumer`. It runs independently: RisingWave creates and
+manages its own publication/slot (auto-named `rw_publication_*` /
+`rw_cdc_*`), completely separate from the app's `pglp_publication` /
+`pglp_slot`. Postgres allows any number of independent replication
+slots on the same database, so both can read the WAL at the same time
+without conflicting.
+
+```
+docker compose up -d
+```
+
+Connect to it (e.g. from inside the `postgres` container, which has
+`psql`):
+
+```
+docker compose exec postgres psql -h risingwave -p 4566 -d dev -U root
+```
+
+Then set up a CDC source against `pglp_dev` and mirror a table:
+
+```sql
+CREATE SOURCE pg_source WITH (
+  connector = 'postgres-cdc',
+  hostname = 'postgres',
+  port = '5432',
+  username = 'postgres',
+  password = 'postgres',
+  database.name = 'pglp_dev'
+);
+
+CREATE TABLE items (
+  id int PRIMARY KEY,
+  name text
+) FROM pg_source TABLE 'public.items';
+
+SELECT * FROM items;
+```
+
+Inserts/updates/deletes on `items` in Postgres show up in RisingWave's
+`items` within a couple of seconds. The RisingWave dashboard is at
+<http://localhost:5691>.
+
 ## Performance testing
 
 `mix pglp.perf` measures how many replication events the consumer can

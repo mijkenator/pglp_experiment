@@ -25,5 +25,32 @@ services:
       timeout: 5s
       retries: 10
 
+  # Single-node RisingWave, for experimenting with consuming pglp_dev via
+  # its built-in postgres-cdc connector (its own publication/slot,
+  # independent of the Elixir Consumer's — Postgres allows multiple
+  # replication slots on the same database, each with its own reader).
+  #
+  # Connect with: psql -h localhost -p 4566 -d dev -U root
+  # See README for the CREATE SOURCE / CREATE TABLE ... FROM ... syntax.
+  risingwave:
+    image: risingwavelabs/risingwave:v3.1.0
+    container_name: pglp_risingwave
+    restart: unless-stopped
+    command: ["single_node"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4566:4566"
+      - "5691:5691"
+    volumes:
+      - pglp_rwdata:/root/.risingwave
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:5691/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
 volumes:
   pglp_pgdata:
+  pglp_rwdata:

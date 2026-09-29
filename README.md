@@ -105,6 +105,45 @@ for the full explanation.
    ./scripts/teardown.sh
    ```
 
+## Performance testing
+
+`mix pglp.perf` measures how many replication events the consumer can
+handle per second. It drives its own fast, direct (no `psql` round trips)
+load generator against a dedicated table/publication/slot — so it doesn't
+touch your dev `items` table or the app's default slot — and reports
+throughput, replication lag, and a correctness check (no missing/dropped
+events):
+
+```
+docker compose up -d
+mix pglp.perf                                    # 10,000 rows -> 20,000 events
+mix pglp.perf --rows 100000                       # scale up
+mix pglp.perf --rows 50000 --batch-size 1000
+mix pglp.perf --rows 50000 --ack-every-commit 10  # ack every 10th commit instead of every one
+```
+
+Sample output:
+
+```
+== Results ==
+Events received:   40000 / 40000
+By type:           %{insert: 20000, update: 20000}
+Consumption time:  722.6ms
+Throughput:        55359.0 events/sec
+Acks sent:         80 (for 80 commits)
+Replication lag:   min=-6120µs mean=4.5ms p95=14.3ms max=19.2ms (n=80 commits)
+Correctness:       OK, all 20000 row ids observed, no gaps
+```
+
+`--ack-every-commit N` (default `1`) controls how many commits the
+consumer batches before proactively acknowledging them back to Postgres.
+Raising it sends fewer acks (`Acks sent` above drops accordingly) at the
+cost of a larger post-crash redelivery window — up to `N - 1` already
+fully-processed commits could be replayed after a crash before the next
+ack would have gone out.
+
+See `mix help pglp.perf` for details on what's measured and how.
+
 ## Configuration
 
 Connection and replication settings are read from environment variables

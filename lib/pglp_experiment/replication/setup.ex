@@ -59,4 +59,28 @@ defmodule PglpExperiment.Replication.Setup do
       Logger.info("Replication slot #{inspect(slot_name)} already exists, skipping")
     end
   end
+
+  @doc """
+  Drops the publication and replication slot created by `ensure!/3`, if
+  they exist. Used to tear down disposable publications/slots, e.g. the
+  ones `mix pglp.perf` creates for a single test run.
+
+  The replication slot cannot be dropped while a connection is still
+  attached to it — callers must stop any `Consumer` using it first.
+  """
+  def drop!(connection_opts, publication_name, slot_name) do
+    {:ok, conn} = Postgrex.start_link(connection_opts)
+
+    try do
+      Postgrex.query!(conn, "DROP PUBLICATION IF EXISTS #{publication_name}", [])
+      Postgrex.query!(conn, "SELECT pg_drop_replication_slot($1)", [slot_name])
+    rescue
+      error in [Postgrex.Error] ->
+        unless error.postgres.code == :undefined_object, do: reraise(error, __STACKTRACE__)
+    after
+      GenServer.stop(conn)
+    end
+
+    :ok
+  end
 end

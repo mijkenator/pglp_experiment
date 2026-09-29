@@ -19,6 +19,18 @@ defmodule PglpExperiment.Replication.Consumer do
   every Insert/Update/Delete in that transaction has already been handled.
   We never acknowledge a position while a transaction is still in flight.
 
+  The `:ack_every_commit` option (default `1`) controls how often that
+  proactive ack is actually sent: with the default, every commit is
+  acked immediately; with e.g. `10`, only every 10th commit triggers a
+  standby status update (still for the *latest* `last_committed_lsn` at
+  that point, so no correctness is lost — commits 1-9 are simply left
+  unacknowledged until commit 10 acks all of them at once). Raising this
+  trades a larger post-crash redelivery window (in the worst case, up to
+  `ack_every_commit - 1` already-fully-processed commits get redelivered
+  and reprocessed) for fewer acks sent, which matters at high throughput.
+  The keepalive path is unaffected by this setting and still acks
+  `last_committed_lsn` on the server's own cadence as a backstop.
+
   This gives the standard logical-replication delivery contract:
 
     * **Nothing is lost.** If the app crashes mid-transaction (or even
@@ -36,6 +48,31 @@ defmodule PglpExperiment.Replication.Consumer do
 
   On every (re)connect we log the slot's current `confirmed_flush_lsn`
   before streaming, so you can see exactly where a restart resumes from.
+
+  ## Telemetry
+
+  Three `:telemetry` events are emitted for external instrumentation (e.g.
+  `PglpExperiment.Perf` performance tests):
+
+    * `[:pglp_experiment, :replication, :change]` — emitted for every
+      decoded insert/update/delete/truncate, right after it's handled.
+      Measurements: `%{count: 1}`. Metadata: `%{type: :insert | :update |
+      :delete | :truncate, relation_oid: integer | nil, row: map | nil}`
+      — `row` is the new row (or, for deletes, the old row) as a
+      `%{column_name => value}` map when the relation is known, `nil`
+      otherwise (e.g. truncate, or a change on a relation we haven't
+      cached yet).
+    * `[:pglp_experiment, :replication, :commit]` — emitted for every
+      commit, right after `last_committed_lsn` is advanced. Measurements:
+      `%{lsn: integer, commit_timestamp: integer}` (the WAL commit
+      timestamp, microseconds since the Postgres epoch — see
+      `commit_timestamp_to_unix/1`). Metadata: `%{}`.
+    * `[:pglp_experiment, :replication, :ack]` — emitted every time a
+      standby status update is actually sent back to Postgres, whether
+      triggered by `:ack_every_commit` or by a keepalive reply.
+      Measurements: `%{lsn: integer}`. Metadata: `%{}`. Useful for
+      counting how many acks a given `:ack_every_commit` setting actually
+      produces under load.
   """
 
   use Postgrex.ReplicationConnection
@@ -48,13 +85,22 @@ defmodule PglpExperiment.Replication.Consumer do
 
   `opts` must contain the standard Postgrex connection options
   (`:hostname`, `:port`, `:database`, `:username`, `:password`) plus
-  `:publication_name` and `:slot_name`.
+  `:publication_name` and `:slot_name`. An optional `:quiet` boolean
+  (default `false`) skips the per-change `Logger.info/1` call — useful for
+  performance tests, where logging every event would itself become the
+  bottleneck and skew throughput measurements. Telemetry events (see
+  moduledoc) are always emitted regardless of `:quiet`. An optional
+  `:name` registers the replication connection process under that name
+  (not applied to the short-lived setup connection). An optional
+  `:ack_every_commit` positive integer (default `1`) controls how many
+  commits accumulate before an ack is proactively sent — see moduledoc.
   """
   def start_link(opts) do
     {publication_name, opts} = Keyword.pop!(opts, :publication_name)
     {slot_name, opts} = Keyword.pop!(opts, :slot_name)
-
-    connection_opts = opts
+    {quiet?, opts} = Keyword.pop(opts, :quiet, false)
+    {ack_every_commit, opts} = Keyword.pop(opts, :ack_every_commit, 1)
+    {name, connection_opts} = Keyword.pop(opts, :name)
 
     Setup.ensure!(connection_opts, publication_name, slot_name)
 
@@ -63,14 +109,16 @@ defmodule PglpExperiment.Replication.Consumer do
       slot_name: slot_name,
       relations: %{},
       last_committed_lsn: 0,
+      quiet?: quiet?,
+      ack_every_commit: ack_every_commit,
+      commits_since_ack: 0,
       step: nil
     }
 
-    Postgrex.ReplicationConnection.start_link(
-      __MODULE__,
-      state,
-      connection_opts ++ [auto_reconnect: true]
-    )
+    replication_opts =
+      connection_opts ++ [auto_reconnect: true] ++ if(name, do: [name: name], else: [])
+
+    Postgrex.ReplicationConnection.start_link(__MODULE__, state, replication_opts)
   end
 
   @impl true
@@ -129,19 +177,22 @@ defmodule PglpExperiment.Replication.Consumer do
 
   # XLogData message: `w` <starting LSN::64> <ending LSN::64> <clock::64> <payload>
   #
-  # We ack (send a standby status update) immediately after every commit,
-  # rather than waiting for the server's own keepalive ping — keepalives
-  # default to a ~10s interval, which would otherwise leave a long window
-  # where fully-processed transactions sit unacknowledged and would be
-  # needlessly redelivered after a crash in that window.
+  # We proactively ack (send a standby status update) every
+  # `:ack_every_commit` commits, rather than waiting for the server's own
+  # keepalive ping — keepalives default to a ~10s interval, which would
+  # otherwise leave a long window where fully-processed transactions sit
+  # unacknowledged and would be needlessly redelivered after a crash in
+  # that window. With the default `ack_every_commit: 1` this acks every
+  # single commit; higher values trade a larger redelivery window for
+  # fewer acks sent (see moduledoc).
   def handle_data(<<?w, _start_lsn::64, _end_lsn::64, _clock::64, payload::binary>>, state) do
     decoded = Decoder.decode(payload)
     new_state = handle_message(decoded, state)
 
-    messages =
+    {messages, new_state} =
       case decoded do
-        %{type: :commit} -> [standby_status_update(new_state.last_committed_lsn)]
-        _ -> []
+        %{type: :commit} -> maybe_ack(new_state)
+        _ -> {[], new_state}
       end
 
     {:noreply, messages, new_state}
@@ -158,27 +209,38 @@ defmodule PglpExperiment.Replication.Consumer do
   end
 
   defp handle_message(%{type: :insert} = msg, state) do
-    log_change("INSERT", msg.relation_oid, nil, msg.tuple, state)
+    new_row = row_map(state, msg.relation_oid, msg.tuple)
+    unless state.quiet?, do: log_change("INSERT", msg.relation_oid, nil, new_row, state)
+    emit_change(:insert, msg.relation_oid, new_row)
     state
   end
 
   defp handle_message(%{type: :update} = msg, state) do
-    log_change("UPDATE", msg.relation_oid, msg.old_tuple, msg.tuple, state)
+    old_row = row_map(state, msg.relation_oid, msg.old_tuple)
+    new_row = row_map(state, msg.relation_oid, msg.tuple)
+    unless state.quiet?, do: log_change("UPDATE", msg.relation_oid, old_row, new_row, state)
+    emit_change(:update, msg.relation_oid, new_row)
     state
   end
 
   defp handle_message(%{type: :delete} = msg, state) do
-    log_change("DELETE", msg.relation_oid, msg.old_tuple, nil, state)
+    old_row = row_map(state, msg.relation_oid, msg.old_tuple)
+    unless state.quiet?, do: log_change("DELETE", msg.relation_oid, old_row, nil, state)
+    emit_change(:delete, msg.relation_oid, old_row)
     state
   end
 
   defp handle_message(%{type: :truncate} = msg, state) do
-    tables =
-      msg.relation_oids
-      |> Enum.map(&relation_label(state, &1))
-      |> Enum.join(", ")
+    unless state.quiet? do
+      tables =
+        msg.relation_oids
+        |> Enum.map(&relation_label(state, &1))
+        |> Enum.join(", ")
 
-    Logger.info("TRUNCATE #{tables}")
+      Logger.info("TRUNCATE #{tables}")
+    end
+
+    emit_change(:truncate, nil, nil)
     state
   end
 
@@ -189,18 +251,46 @@ defmodule PglpExperiment.Replication.Consumer do
   # Postgres. This is what makes restarts resume without gaps: we never
   # tell the server we've flushed a transaction we haven't fully applied.
   defp handle_message(%{type: :commit} = msg, state) do
-    Logger.debug("Committed transaction, advancing confirmed LSN to #{msg.end_lsn}")
-    %{state | last_committed_lsn: msg.end_lsn}
+    # Logger.debug("Committed transaction, advancing confirmed LSN to #{msg.end_lsn}")
+
+    :telemetry.execute(
+      [:pglp_experiment, :replication, :commit],
+      %{lsn: msg.end_lsn, commit_timestamp: msg.commit_timestamp},
+      %{}
+    )
+
+    %{
+      state
+      | last_committed_lsn: msg.end_lsn,
+        commits_since_ack: state.commits_since_ack + 1
+    }
   end
 
   defp handle_message(%{type: type}, state) when type in [:origin, :pg_type, :unknown] do
     state
   end
 
-  defp log_change(action, relation_oid, old_tuple, new_tuple, state) do
+  # Only sends an ack once `:ack_every_commit` commits have accumulated
+  # since the last one, resetting the counter; otherwise leaves it
+  # incremented and sends nothing (the keepalive path still acks
+  # `last_committed_lsn` on its own cadence as a backstop).
+  defp maybe_ack(%{commits_since_ack: count, ack_every_commit: every} = state)
+       when count >= every do
+    {[standby_status_update(state.last_committed_lsn)], %{state | commits_since_ack: 0}}
+  end
+
+  defp maybe_ack(state), do: {[], state}
+
+  defp emit_change(type, relation_oid, row) do
+    :telemetry.execute(
+      [:pglp_experiment, :replication, :change],
+      %{count: 1},
+      %{type: type, relation_oid: relation_oid, row: row}
+    )
+  end
+
+  defp log_change(action, relation_oid, old_row, new_row, state) do
     table = relation_label(state, relation_oid)
-    old_row = row_map(state, relation_oid, old_tuple)
-    new_row = row_map(state, relation_oid, new_tuple)
 
     message =
       case {old_row, new_row} do
@@ -235,14 +325,28 @@ defmodule PglpExperiment.Replication.Consumer do
   end
 
   defp standby_status_update(lsn) do
+    :telemetry.execute([:pglp_experiment, :replication, :ack], %{lsn: lsn}, %{})
+
     next = lsn + 1
     <<?r, next::64, next::64, next::64, current_time()::64, 0>>
   end
+
+  @pg_epoch_offset_us 946_684_800_000_000
 
   # Microseconds since 2000-01-01, per the replication protocol's timestamp
   # epoch. `System.os_time/1` avoids the `Date`/`DateTime` "no wall clock at
   # compile time" restriction some environments apply.
   defp current_time do
-    System.os_time(:microsecond) - 946_684_800_000_000
+    System.os_time(:microsecond) - @pg_epoch_offset_us
+  end
+
+  @doc """
+  Converts a WAL `commit_timestamp` (as emitted in the
+  `[:pglp_experiment, :replication, :commit]` telemetry event — microseconds
+  since 2000-01-01) into Unix time in microseconds, so it can be compared
+  against `System.os_time(:microsecond)` to measure replication lag.
+  """
+  def commit_timestamp_to_unix(commit_timestamp) do
+    commit_timestamp + @pg_epoch_offset_us
   end
 end

@@ -20,7 +20,8 @@ defmodule PglpExperiment.MixProject do
 
   defp deps do
     [
-      {:postgrex, "~> 0.19"}
+      {:postgrex, "~> 0.19"},
+      {:telemetry, "~> 1.0"}
     ]
   end
 end

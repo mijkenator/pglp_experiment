@@ -36,6 +36,25 @@ defmodule PglpExperiment.Replication.Consumer do
 
   On every (re)connect we log the slot's current `confirmed_flush_lsn`
   before streaming, so you can see exactly where a restart resumes from.
+
+  ## Telemetry
+
+  Two `:telemetry` events are emitted for external instrumentation (e.g.
+  `PglpExperiment.Perf` performance tests):
+
+    * `[:pglp_experiment, :replication, :change]` — emitted for every
+      decoded insert/update/delete/truncate, right after it's handled.
+      Measurements: `%{count: 1}`. Metadata: `%{type: :insert | :update |
+      :delete | :truncate, relation_oid: integer | nil, row: map | nil}`
+      — `row` is the new row (or, for deletes, the old row) as a
+      `%{column_name => value}` map when the relation is known, `nil`
+      otherwise (e.g. truncate, or a change on a relation we haven't
+      cached yet).
+    * `[:pglp_experiment, :replication, :commit]` — emitted for every
+      commit, right after `last_committed_lsn` is advanced. Measurements:
+      `%{lsn: integer, commit_timestamp: integer}` (the WAL commit
+      timestamp, microseconds since the Postgres epoch — see
+      `commit_timestamp_to_unix/1`). Metadata: `%{}`.
   """
 
   use Postgrex.ReplicationConnection
@@ -48,13 +67,19 @@ defmodule PglpExperiment.Replication.Consumer do
 
   `opts` must contain the standard Postgrex connection options
   (`:hostname`, `:port`, `:database`, `:username`, `:password`) plus
-  `:publication_name` and `:slot_name`.
+  `:publication_name` and `:slot_name`. An optional `:quiet` boolean
+  (default `false`) skips the per-change `Logger.info/1` call — useful for
+  performance tests, where logging every event would itself become the
+  bottleneck and skew throughput measurements. Telemetry events (see
+  moduledoc) are always emitted regardless of `:quiet`. An optional
+  `:name` registers the replication connection process under that name
+  (not applied to the short-lived setup connection).
   """
   def start_link(opts) do
     {publication_name, opts} = Keyword.pop!(opts, :publication_name)
     {slot_name, opts} = Keyword.pop!(opts, :slot_name)
-
-    connection_opts = opts
+    {quiet?, opts} = Keyword.pop(opts, :quiet, false)
+    {name, connection_opts} = Keyword.pop(opts, :name)
 
     Setup.ensure!(connection_opts, publication_name, slot_name)
 
@@ -63,14 +88,14 @@ defmodule PglpExperiment.Replication.Consumer do
       slot_name: slot_name,
       relations: %{},
       last_committed_lsn: 0,
+      quiet?: quiet?,
       step: nil
     }
 
-    Postgrex.ReplicationConnection.start_link(
-      __MODULE__,
-      state,
-      connection_opts ++ [auto_reconnect: true]
-    )
+    replication_opts =
+      connection_opts ++ [auto_reconnect: true] ++ if(name, do: [name: name], else: [])
+
+    Postgrex.ReplicationConnection.start_link(__MODULE__, state, replication_opts)
   end
 
   @impl true
@@ -158,27 +183,38 @@ defmodule PglpExperiment.Replication.Consumer do
   end
 
   defp handle_message(%{type: :insert} = msg, state) do
-    log_change("INSERT", msg.relation_oid, nil, msg.tuple, state)
+    new_row = row_map(state, msg.relation_oid, msg.tuple)
+    unless state.quiet?, do: log_change("INSERT", msg.relation_oid, nil, new_row, state)
+    emit_change(:insert, msg.relation_oid, new_row)
     state
   end
 
   defp handle_message(%{type: :update} = msg, state) do
-    log_change("UPDATE", msg.relation_oid, msg.old_tuple, msg.tuple, state)
+    old_row = row_map(state, msg.relation_oid, msg.old_tuple)
+    new_row = row_map(state, msg.relation_oid, msg.tuple)
+    unless state.quiet?, do: log_change("UPDATE", msg.relation_oid, old_row, new_row, state)
+    emit_change(:update, msg.relation_oid, new_row)
     state
   end
 
   defp handle_message(%{type: :delete} = msg, state) do
-    log_change("DELETE", msg.relation_oid, msg.old_tuple, nil, state)
+    old_row = row_map(state, msg.relation_oid, msg.old_tuple)
+    unless state.quiet?, do: log_change("DELETE", msg.relation_oid, old_row, nil, state)
+    emit_change(:delete, msg.relation_oid, old_row)
     state
   end
 
   defp handle_message(%{type: :truncate} = msg, state) do
-    tables =
-      msg.relation_oids
-      |> Enum.map(&relation_label(state, &1))
-      |> Enum.join(", ")
+    unless state.quiet? do
+      tables =
+        msg.relation_oids
+        |> Enum.map(&relation_label(state, &1))
+        |> Enum.join(", ")
 
-    Logger.info("TRUNCATE #{tables}")
+      Logger.info("TRUNCATE #{tables}")
+    end
+
+    emit_change(:truncate, nil, nil)
     state
   end
 
@@ -190,6 +226,13 @@ defmodule PglpExperiment.Replication.Consumer do
   # tell the server we've flushed a transaction we haven't fully applied.
   defp handle_message(%{type: :commit} = msg, state) do
     Logger.debug("Committed transaction, advancing confirmed LSN to #{msg.end_lsn}")
+
+    :telemetry.execute(
+      [:pglp_experiment, :replication, :commit],
+      %{lsn: msg.end_lsn, commit_timestamp: msg.commit_timestamp},
+      %{}
+    )
+
     %{state | last_committed_lsn: msg.end_lsn}
   end
 
@@ -197,10 +240,16 @@ defmodule PglpExperiment.Replication.Consumer do
     state
   end
 
-  defp log_change(action, relation_oid, old_tuple, new_tuple, state) do
+  defp emit_change(type, relation_oid, row) do
+    :telemetry.execute(
+      [:pglp_experiment, :replication, :change],
+      %{count: 1},
+      %{type: type, relation_oid: relation_oid, row: row}
+    )
+  end
+
+  defp log_change(action, relation_oid, old_row, new_row, state) do
     table = relation_label(state, relation_oid)
-    old_row = row_map(state, relation_oid, old_tuple)
-    new_row = row_map(state, relation_oid, new_tuple)
 
     message =
       case {old_row, new_row} do
@@ -239,10 +288,22 @@ defmodule PglpExperiment.Replication.Consumer do
     <<?r, next::64, next::64, next::64, current_time()::64, 0>>
   end
 
+  @pg_epoch_offset_us 946_684_800_000_000
+
   # Microseconds since 2000-01-01, per the replication protocol's timestamp
   # epoch. `System.os_time/1` avoids the `Date`/`DateTime` "no wall clock at
   # compile time" restriction some environments apply.
   defp current_time do
-    System.os_time(:microsecond) - 946_684_800_000_000
+    System.os_time(:microsecond) - @pg_epoch_offset_us
+  end
+
+  @doc """
+  Converts a WAL `commit_timestamp` (as emitted in the
+  `[:pglp_experiment, :replication, :commit]` telemetry event — microseconds
+  since 2000-01-01) into Unix time in microseconds, so it can be compared
+  against `System.os_time(:microsecond)` to measure replication lag.
+  """
+  def commit_timestamp_to_unix(commit_timestamp) do
+    commit_timestamp + @pg_epoch_offset_us
   end
 end

@@ -190,12 +190,19 @@ than they committed.
 
 | | HTTP sink → Elixir receiver | `RisingWave.Consumer` (current) |
 |---|---|---|
+| Infrastructure required | **None beyond RisingWave + Elixir** — RisingWave POSTs straight to a Plug/Phoenix endpoint | None beyond RisingWave + Elixir |
 | Elixir-side complexity | Need an HTTP server, plus handling for reordering/dedup | Already built — no server needed |
 | Ordering | **Not guaranteed** (verified) | Guaranteed — `FETCH NEXT` returns commit order |
 | Resume after an outage | Backoff retry from RisingWave's memory; untested how it behaves across a RisingWave restart mid-backlog | Solved: on-disk `Checkpoint` + `SINCE <ts>`, bounded by the subscription's `retention` window |
 | Visibility into lag | None — a request either arrives or doesn't | `rw_timestamp` on every row |
 | Latency | Lower (push as soon as committed) | Bounded by `fetch_timeout_seconds` (default 5s) |
 | New failure surface | A whole HTTP server to run/secure/monitor | None — reuses the already-validated TCP client |
+
+Note this table is HTTP sink vs. this repo's *own* polling consumer — both
+require zero extra infrastructure beyond RisingWave and Elixir. The
+"Kafka sink" section below adds a third option that trades that
+simplicity for guaranteed ordering, at the cost of a whole new broker
+service — see that section for the fuller three-way tradeoff.
 
 **Verdict for this app:** keep polling. The HTTP sink is a reasonable
 choice if a consumer can tolerate reordering and dedupe independently,
@@ -289,16 +296,19 @@ every axis that matters here**: it has a real throughput lever the
 push mechanism lacks, and it preserves ordering, which the HTTP sink
 does not.
 
-## The Kafka sink — the best push-based option, if push is required
+## The Kafka sink — trades infrastructure for guaranteed ordering
 
 RisingWave supports 22 sink connectors in total (Kafka, Pulsar, NATS,
 MQTT, Elasticsearch, Redis, Iceberg, Snowflake, ClickHouse, and more —
 see [RisingWave's data delivery overview](https://docs.risingwave.com/delivery/overview)
 for the full list). Of all of them, `connector = 'kafka'` is the one
-that would actually solve the HTTP sink's problems if a push-based
-design were required instead of `RisingWave.Consumer`'s poll loop —
-evaluated here on the same three axes as the rest of this document
-(performance, ease of implementation, Elixir library support), without
+that would solve the HTTP sink's ordering problem — but **this is a
+real tradeoff, not a strict upgrade**: the HTTP sink's biggest advantage
+is that RisingWave delivers straight to an Elixir endpoint with *zero*
+extra infrastructure (see the table above), and Kafka gives that up.
+Evaluated here on the same three axes as the rest of this document
+(performance, ease of implementation, Elixir library support), plus the
+infrastructure cost that makes this a genuine either/or decision, not
 having stood one up against the running stack the way the Postgres and
 HTTP sinks were.
 
@@ -352,6 +362,18 @@ stack.
 
 ### Delivery semantics and tradeoffs
 
+- **A whole new service, not just a new dependency.** This is the
+  headline cost, not a footnote: a Kafka (or Kafka-compatible, e.g.
+  Redpanda) *broker* must exist and be run, monitored, secured, and
+  upgraded — not just a library added to the Elixir app. The HTTP sink
+  needs none of that; RisingWave talks straight to a Plug/Phoenix
+  endpoint. For a deployment that doesn't already run Kafka for other
+  reasons, this is a genuinely new piece of infrastructure to operate
+  indefinitely, purely to relay data between two systems that could
+  otherwise talk directly. This repo's current single-node
+  `docker-compose` setup has no broker today (RisingWave's own
+  distributed setup runs Redpanda internally, but that's a different,
+  much heavier deployment than what this repo uses).
 - **At-least-once, not exactly-once** — RisingWave's Kafka sink writes
   non-transactionally, per RisingWave's own docs. Same duplicate-on-retry
   contract as everything else in this repo; `UPSERT` format dedups
@@ -364,23 +386,32 @@ stack.
   "backlog only visible via RisingWave's own metrics, not from the
   consumer side" blind spot. Not a regression versus the HTTP sink, but
   not eliminated either.
-- **One more moving part** — a Kafka (or Kafka-compatible, e.g. Redpanda)
-  broker must exist. Not a new requirement for a RisingWave deployment
-  generally (RisingWave's own distributed `docker-compose` setup already
-  runs Redpanda internally), but this repo's current single-node setup
-  doesn't have one, so adopting this path means adding a broker service.
 
-### Verdict
+### Verdict: a real tradeoff, not a strict upgrade
 
-Of the 22 supported connectors, Kafka is the one that combines real
-throughput headroom, a mature Elixir client stack, and — critically —
-an actual ordering guarantee that the HTTP sink concretely failed to
-provide (see "What was verified" above). If a push-based design is ever
-adopted instead of `RisingWave.Consumer`'s poll loop, this is the
-connector to reach for — but it would need its own hands-on
-verification pass (ordering, throughput, decoupling latency) against a
-real broker before treating any of the above as confirmed the way the
-rest of this document's findings are.
+**Choose based on what the receiver can tolerate, not on ordering
+alone:**
+
+- If the Elixir side can dedupe by `{primary_key, op}` and doesn't need
+  strict commit-order delivery (true for a surprising number of use
+  cases — e.g. anything that just needs "eventually consistent, latest
+  wins"), the **HTTP sink is the better choice**: zero new
+  infrastructure, RisingWave delivers directly, and `rw_timestamp` still
+  arrives on every payload if the receiver wants to buffer-and-resort
+  itself rather than trust arrival order.
+- If strict per-row ordering is a hard requirement and the extra
+  operational surface of running a broker is acceptable (e.g. a broker
+  already exists for other reasons, or the deployment is large enough
+  that one is justified anyway), **Kafka is the right connector** among
+  the 22 supported — it has a real throughput lever the HTTP sink
+  lacks, and a mature Elixir client stack (`broadway_kafka`/`:brod`)
+  ready to use.
+
+Either way, this needs its own hands-on verification pass (ordering,
+throughput, decoupling latency against a real broker) before treating
+the Kafka-specific claims above as confirmed the way the rest of this
+document's findings — which *were* verified against the running
+stack — are.
 
 ## Related documentation
 

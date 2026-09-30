@@ -21,6 +21,24 @@ defmodule PglpExperiment.RisingWave.Client do
       ERROR XX000 (internal_error): Failed to bind expression: t.typsend
         Item not found: missing FROM-clause entry for table "t"
 
+  Passing the undocumented `types: false` is a near-miss worth noting:
+  `Postgrex.Utils.default_opts/1` uses `Keyword.put_new` for the
+  `:types` default, so an explicit `false` (unlike `nil`, which trips
+  the `KeyError` above) survives as a "present but falsy" value —
+  which happens to satisfy the internal `types_key: if(types_mod, do:
+  ..., else: nil)` check the same way omitting bootstrapping does, so
+  `start_link/1` actually succeeds and skips the bootstrap query
+  entirely. But the connection is then unusable for any real query:
+  the default extended query protocol needs the (now-empty) type table
+  to `Describe` result column types and crashes with `** (FunctionClauseError)
+  no function clause matching in Postgrex.Types.fetch/2`; forcing the
+  simple protocol instead (`query_type: :text`) gets further but still
+  crashes decoding the result, since `Postgrex.Types.decode_simple/2`
+  unconditionally pattern-matches on a populated `{mod, table}` type
+  state — there's no partial/lazy mode. Every path through Postgrex
+  needs a populated type table before decoding anything, and the only
+  way to populate it is the bootstrap query RisingWave can't answer.
+
   This module talks the wire protocol directly and simply never sends
   that query — we control the entire handshake ourselves.
 

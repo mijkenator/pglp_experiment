@@ -163,6 +163,9 @@ consuming *from* RisingWave, via RisingWave's own
 feature (`CREATE SUBSCRIPTION` + `DECLARE ... SUBSCRIPTION CURSOR` +
 `FETCH NEXT ... WITH (timeout = ...)`).
 
+See [`docs/risingwave-consumer.md`](docs/risingwave-consumer.md) for a
+full module-by-module walkthrough of how this is implemented.
+
 This can't use Postgrex — every Postgrex connection path unconditionally
 runs a `pg_type` bootstrap query that RisingWave's catalog can't satisfy
 (missing the `typsend` column it needs), which kills the connection

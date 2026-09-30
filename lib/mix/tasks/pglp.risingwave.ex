@@ -10,12 +10,21 @@ defmodule Mix.Tasks.Pglp.Risingwave do
   ## Usage
 
       mix pglp.risingwave
+      mix pglp.risingwave --batch-size 100
 
   This automates, for repeated use, the same `CREATE SOURCE` / `CREATE
   TABLE ... FROM ... TABLE '...'` / `CREATE SUBSCRIPTION` steps the
   README's "RisingWave (optional...)" section walks through by hand via
   `psql` — use the manual walkthrough to poke around first; use this
   once you just want the consumer running.
+
+  `--batch-size N` (alias `-b`, default `1`) controls how many rows are
+  requested per `FETCH` round-trip — see the `:batch_size` option on
+  `PglpExperiment.RisingWave.Consumer.start_link/1` for the throughput
+  numbers (measured: ~80x higher sustained throughput at batch size
+  1000 vs. 1, draining a backlog, with no added latency under normal
+  load since `FETCH <N> ... WITH (timeout = ...)` returns as soon as
+  any row is available rather than waiting to fill a full batch).
 
   ## Prerequisites
 
@@ -53,13 +62,21 @@ defmodule Mix.Tasks.Pglp.Risingwave do
   alias PglpExperiment.RisingWave.Consumer
 
   @impl Mix.Task
-  def run(_args) do
+  def run(args) do
     # Deliberately `app.config` (loads config, compiles, does NOT start
     # the supervision tree) rather than `app.start` — mirrors
     # `mix pglp.perf`'s reasoning: we don't want the main app's own
     # Postgres Consumer starting here, just the config/deps we need.
     Mix.Task.run("app.config")
     {:ok, _} = Application.ensure_all_started(:telemetry)
+
+    {opts, _} =
+      OptionParser.parse!(args,
+        strict: [batch_size: :integer],
+        aliases: [b: :batch_size]
+      )
+
+    batch_size = opts[:batch_size] || 1
 
     rw_config = Application.fetch_env!(:pglp_experiment, :risingwave)
 
@@ -92,6 +109,7 @@ defmodule Mix.Tasks.Pglp.Risingwave do
           table_name: rw_config[:table_name],
           subscription_name: rw_config[:subscription_name],
           fetch_timeout_seconds: rw_config[:fetch_timeout_seconds],
+          batch_size: batch_size,
           setup_opts: setup_opts
         ]
 
@@ -105,7 +123,10 @@ defmodule Mix.Tasks.Pglp.Risingwave do
         max_seconds: 10
       )
 
-    Mix.shell().info("RisingWave consumer running (Ctrl-C to stop)...")
+    Mix.shell().info(
+      "RisingWave consumer running with batch_size=#{batch_size} (Ctrl-C to stop)..."
+    )
+
     Process.sleep(:infinity)
   end
 end

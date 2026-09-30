@@ -203,6 +203,60 @@ and lower latency matters more than strict ordering — but that's a
 different set of guarantees than what `RisingWave.Consumer` was built
 to preserve.
 
+### Sink decoupling: what happens if the receiver is down or slow
+
+RisingWave inserts an internal buffer — the **sink log store** — between
+its streaming engine and every sink connector (HTTP included),
+controlled by the `sink_decouple` session variable (confirmed live:
+`SET sink_decouple = true|false` is accepted; `SHOW ALL` reports it as
+`"Enable decoupling sink and internal streaming graph or not"`,
+defaulting to a tri-state `default` — RisingWave decides per-connector
+unless forced). Its purpose: isolate the streaming engine from a slow
+or down sink, so backpressure from the sink doesn't stall RisingWave's
+own internal checkpointing.
+
+**How big can that buffer get?** Effectively unbounded, up to your
+storage backend's capacity — not a fixed row/byte cap. The log store is
+backed by **Hummock**, RisingWave's own LSM-tree storage engine (the
+same compute/storage-separated layer everything else in RisingWave
+uses). There's a small, genuinely bounded staging buffer in front of it
+in memory, but once flushed, data lives in Hummock, which is backed by
+your configured object storage (S3/GCS/MinIO, or the local filesystem
+in this repo's single-node `docker-compose` setup) — no hard size limit
+at that layer. **A stalled sink does not cause data loss; it causes
+unbounded storage growth and a growing backlog until the receiver comes
+back** (or the storage backend itself runs out of space).
+
+**Two findings worth flagging, verified directly rather than assumed:**
+
+- **Decoupling is not what causes the HTTP sink's reordering.** Retested
+  the earlier out-of-order result (3 rows in one statement arriving as
+  1, 3, 2) with `sink_decouple` explicitly set to `false` — rows still
+  arrived out of order. The reordering is a property of how the HTTP
+  sink executor dispatches requests (evidently concurrently), not of
+  the decoupling buffer sitting in front of it.
+- **The documented 10–60s decoupled-commit latency did not reproduce
+  on this local single-node setup** — a row inserted with
+  `sink_decouple = true` showed up at the HTTP receiver in well under a
+  second. This is very likely because a single-node dev container runs
+  a much shorter internal checkpoint interval than whatever
+  multi-node/production configuration that figure assumes; not
+  something to rely on as a number in this environment specifically.
+
+**Why this matters for an HTTP-sink-as-Elixir-receiver design:** if the
+receiver goes down, RisingWave will keep the backlog in Hummock and
+retry once it's back (matches the backoff/redelivery behavior verified
+earlier) — but there is **no signal to the receiver that a backlog is
+building**, unlike this repo's polling design, where `rw_timestamp` on
+every row makes lag directly observable, and the subscription's
+`retention` window is a known, hard ceiling on how far behind a
+consumer can fall before losing the ability to resume cleanly (see
+`PglpExperiment.RisingWave.Consumer`'s moduledoc). An HTTP-sink receiver
+outage becomes a silent, growing liability on RisingWave's storage that
+you'd only discover by separately monitoring RisingWave's own
+Hummock/log-store metrics — not something visible from the Elixir side
+at all.
+
 ### Throughput: which one actually scales better?
 
 Measured directly, draining a 20,000-row backlog through each path

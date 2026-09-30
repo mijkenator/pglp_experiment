@@ -203,6 +203,38 @@ and lower latency matters more than strict ordering — but that's a
 different set of guarantees than what `RisingWave.Consumer` was built
 to preserve.
 
+### Throughput: which one actually scales better?
+
+Measured directly, draining a 20,000-row backlog through each path
+against the same running stack:
+
+| Approach | Throughput |
+|---|---|
+| HTTP sink (one POST per row, no batching option exists) | ~1,250–1,365 rows/sec |
+| Polling, `FETCH NEXT` / `FETCH 1` | ~1,129 rows/sec |
+| Polling, `FETCH 10` | ~9,690 rows/sec |
+| Polling, `FETCH 100` | ~52,493 rows/sec |
+| Polling, `FETCH 1000` | ~89,285 rows/sec |
+
+At the same (unbatched) request granularity, the two approaches are
+roughly tied — both cost one network round-trip per row. But **only
+polling has a scaling lever**: `FETCH <N> FROM cursor WITH (timeout =
+...)` returns up to N rows in a single round-trip, confirmed to still
+return as soon as *any* rows are available rather than waiting to fill
+a full batch (so it costs nothing in latency under normal load — see
+`PglpExperiment.RisingWave.Consumer`'s `:batch_size` option, which
+implements exactly this). Batching to 1000 measured **~79x** higher
+throughput than one-row-at-a-time. The HTTP sink has no equivalent —
+confirmed against RisingWave's own connector docs: no batching,
+concurrency, or connection-pool-size option exists for `connector =
+'http'`. It is architecturally capped at one row per HTTP round-trip,
+permanently.
+
+Combined with the reordering issue above, **polling scales better on
+every axis that matters here**: it has a real throughput lever the
+push mechanism lacks, and it preserves ordering, which the HTTP sink
+does not.
+
 ## Related documentation
 
 - [`docs/risingwave-consumer.md`](risingwave-consumer.md) — the

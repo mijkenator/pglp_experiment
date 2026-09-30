@@ -289,6 +289,99 @@ every axis that matters here**: it has a real throughput lever the
 push mechanism lacks, and it preserves ordering, which the HTTP sink
 does not.
 
+## The Kafka sink — the best push-based option, if push is required
+
+RisingWave supports 22 sink connectors in total (Kafka, Pulsar, NATS,
+MQTT, Elasticsearch, Redis, Iceberg, Snowflake, ClickHouse, and more —
+see [RisingWave's data delivery overview](https://docs.risingwave.com/delivery/overview)
+for the full list). Of all of them, `connector = 'kafka'` is the one
+that would actually solve the HTTP sink's problems if a push-based
+design were required instead of `RisingWave.Consumer`'s poll loop —
+evaluated here on the same three axes as the rest of this document
+(performance, ease of implementation, Elixir library support), without
+having stood one up against the running stack the way the Postgres and
+HTTP sinks were.
+
+### Why it solves the HTTP sink's core problem: ordering
+
+Kafka guarantees **strict ordering within a partition** — a
+fundamental property of the log, not something a client library adds.
+RisingWave's Kafka sink uses the sink's `primary_key` as the Kafka
+message key when set (required for `UPSERT`/`DEBEZIUM` format, optional
+for `PLAIN`); standard Kafka producer behavior hash-partitions by
+message key, so all changes for a given row land in the same partition,
+in commit order. This is strongly implied by RisingWave's own docs (the
+`key_encode` property constrains `primary_key`'s type, which only makes
+sense if `primary_key` *is* the message key) and matches how every
+other Kafka-based CDC connector (e.g. Debezium's) behaves — but wasn't
+independently re-verified against a running Kafka broker the way the
+HTTP sink's reordering was directly observed. If this becomes a real
+design, verify it the same way before relying on it.
+
+Either way, this directly addresses the HTTP sink's confirmed failure
+mode: no client-side reordering to guard against, because the ordering
+guarantee is structural (per-partition), not best-effort.
+
+### Performance
+
+Kafka is a real distributed log, not one HTTP request per row. RisingWave's
+producer batches writes into Kafka's own client-level buffering, and
+Kafka consumers pull in large batches natively — the same
+"amortize the round-trip cost across many rows" advantage this repo
+measured for `FETCH <N>` (see "Throughput" above) applies at the
+transport layer here for free, without needing an equivalent to
+`:batch_size` at all.
+
+### Ease of implementation / Elixir library support
+
+This is where Kafka wins most clearly. [`broadway_kafka`](https://hex.pm/packages/broadway_kafka)
+(built on [`:brod`](https://github.com/kafka4beam/brod), a long-established
+Erlang Kafka client) plus [`Broadway`](https://hex.pm/packages/broadway)
+is a mature, idiomatic Elixir stack for exactly this job — declarative
+pipeline configuration, built-in backpressure, and automatic offset
+commit-after-ack (`:offset_commit_on_ack`, defaults to `true`) so a
+crash before processing completes results in reprocessing, not silent
+loss — the same at-least-once shape `RisingWave.Consumer` already
+provides, but without hand-rolling a wire-protocol client the way
+`PglpExperiment.RisingWave.Client` had to be for the subscription-cursor
+path (there was no Elixir Kafka gap to fill the way there was no way to
+talk to RisingWave's subscription cursor with Postgrex — Kafka already
+has one). This is meaningfully less code to write and maintain than the
+polling consumer's `Protocol`/`Client`/`Setup`/`Consumer`/`Checkpoint`
+stack.
+
+### Delivery semantics and tradeoffs
+
+- **At-least-once, not exactly-once** — RisingWave's Kafka sink writes
+  non-transactionally, per RisingWave's own docs. Same duplicate-on-retry
+  contract as everything else in this repo; `UPSERT` format dedups
+  automatically downstream by key, `PLAIN`/append-only format needs the
+  consumer to dedup itself (same pattern already documented for
+  `RisingWave.Consumer`).
+- **Still subject to sink decoupling** — a Kafka sink goes through the
+  same `kv_log_store` buffer as the HTTP sink (see "Sink decoupling"
+  above): up to ~10s added latency by default, and the same
+  "backlog only visible via RisingWave's own metrics, not from the
+  consumer side" blind spot. Not a regression versus the HTTP sink, but
+  not eliminated either.
+- **One more moving part** — a Kafka (or Kafka-compatible, e.g. Redpanda)
+  broker must exist. Not a new requirement for a RisingWave deployment
+  generally (RisingWave's own distributed `docker-compose` setup already
+  runs Redpanda internally), but this repo's current single-node setup
+  doesn't have one, so adopting this path means adding a broker service.
+
+### Verdict
+
+Of the 22 supported connectors, Kafka is the one that combines real
+throughput headroom, a mature Elixir client stack, and — critically —
+an actual ordering guarantee that the HTTP sink concretely failed to
+provide (see "What was verified" above). If a push-based design is ever
+adopted instead of `RisingWave.Consumer`'s poll loop, this is the
+connector to reach for — but it would need its own hands-on
+verification pass (ordering, throughput, decoupling latency) against a
+real broker before treating any of the above as confirmed the way the
+rest of this document's findings are.
+
 ## Related documentation
 
 - [`docs/risingwave-consumer.md`](risingwave-consumer.md) — the

@@ -1,8 +1,8 @@
-# How RisingWave's Postgres sink works
+# How RisingWave's sinks work
 
-This document explains RisingWave's `CREATE SINK ... connector='postgres'`
-— RisingWave pushing data **out to** Postgres — as a third data path
-alongside the two already documented in this repo:
+This document explains RisingWave's `CREATE SINK ...` feature —
+RisingWave pushing data **out** somewhere, as opposed to the other two
+data paths already documented in this repo:
 
 - `postgres-cdc` **source** (RisingWave ← Postgres): RisingWave manages
   its own publication/slot and reads via the actual Postgres replication
@@ -19,10 +19,12 @@ alongside the two already documented in this repo:
   the other two don't.
 
 Nothing in this repo currently wires this up automatically — the
-findings below come from manually creating a sink against the running
+findings below come from manually creating sinks against the running
 `docker-compose` stack and are recorded here for reference.
 
-## Setup
+## Postgres sink
+
+### Setup
 
 ```sql
 CREATE SINK pg_sink FROM sink_source WITH (
@@ -55,9 +57,9 @@ the authoritative source, not any doc page. `type` is also required
 explicitly (`'upsert'` or `'append-only'`); omitting it fails with
 `missing field 'type'`.
 
-## Two sink types, and they behave very differently
+### Two sink types, and they behave very differently
 
-### `type = 'upsert'`
+#### `type = 'upsert'`
 
 Requires `primary_key`. Every `INSERT`/`UPDATE`/`DELETE` on the
 RisingWave side is translated into the equivalent operation on the
@@ -75,7 +77,7 @@ propagates to `sink_target` on Postgres as an insert, then an update,
 then a delete — the row is fully gone from `sink_target` after the
 delete, same as it's gone from `sink_source`.
 
-### `type = 'append-only'`
+#### `type = 'append-only'`
 
 RisingWave **refuses** to create this sink from a table that supports
 updates/deletes (a "retract stream") unless you explicitly add
@@ -112,7 +114,7 @@ understanding `force_append_only`'s consequences will silently corrupt
 the target (stale rows that should have been deleted or replaced stick
 around forever).
 
-## Operational notes
+### Operational notes
 
 - `SHOW SINKS` / `SELECT * FROM rw_catalog.rw_sinks` shows each sink's
   `sink_type` (`SINK_TYPE_UPSERT` / append-only), its full `CREATE SINK`
@@ -128,6 +130,78 @@ around forever).
 - `DROP SINK <name>` cleans it up; the target table on Postgres is
   untouched by the drop (it's a normal table, not something RisingWave
   manages the lifecycle of).
+
+## The HTTP sink — could it replace long-polling from Elixir?
+
+RisingWave also has a generic `connector = 'http'` sink that POSTs
+each row to an arbitrary URL — a genuine push mechanism, unlike
+everything else in this document. Since `RisingWave.Consumer` is a
+poll loop (`FETCH NEXT ... WITH (timeout = ...)` in a cycle), it's
+worth asking whether pointing an HTTP sink at a small Elixir HTTP
+endpoint instead would be a better design. Tested this directly
+against the running stack; the answer for this app is no, for
+reasons that are verifiable, not just theoretical.
+
+### Setup
+
+```sql
+CREATE TABLE http_src (payload jsonb);   -- HTTP sink requires a `payload` (varchar/jsonb) column
+CREATE SINK http_sink FROM http_src WITH (
+  connector = 'http',
+  type = 'append-only',
+  force_append_only = 'true',            -- same tradeoff as above
+  url = 'http://<receiver-host>:<port>/webhook'
+);
+```
+
+A row's `payload` value is POSTed as the request body to `url`,
+one request per row.
+
+### What was verified
+
+- **Real push, with retry.** Stopping the receiver mid-stream and
+  reinserting a row: RisingWave logged the delivery failure and
+  retried with growing backoff (479ms → 1.9s → 2.2s → 2.8s → 15s...,
+  confirmed in its own logs), and **did** eventually redeliver once
+  the receiver came back — so it's not naive fire-and-forget.
+- **No ordering guarantee.** Inserting three rows in a single
+  statement (`VALUES (1), (2), (3)`) produced three POSTs that arrived
+  as **1, 3, 2** — confirmed directly against a real HTTP listener.
+  Rows are evidently delivered concurrently, not serialized in commit
+  order.
+- **Retry state lives only in RisingWave's memory**, not in a durable,
+  inspectable log the way a replication slot or subscription's
+  `retention` window is. There's no equivalent of `rw_timestamp` to
+  tell a receiver "you're behind, and by exactly this much" — a
+  request either arrives or it doesn't; the receiver has no way to
+  ask what it might have missed.
+
+### Why this doesn't fit `RisingWave.Consumer`'s design
+
+`Consumer` explicitly relies on strict ordering: an `UPDATE` arrives as
+a `UpdateDelete`/`UpdateInsert` pair sharing one `rw_timestamp`, and
+the moduledoc is deliberate about *never* processing that pair out of
+order or interleaved with unrelated rows (see "Contrast with the
+Postgres consumer's resume model" in the `Consumer` moduledoc). An
+HTTP sink's confirmed reordering would break that invariant directly —
+a receiver could observe `UpdateInsert` before `UpdateDelete` for the
+same row, or two different rows' changes arriving in a different order
+than they committed.
+
+| | HTTP sink → Elixir receiver | `RisingWave.Consumer` (current) |
+|---|---|---|
+| Elixir-side complexity | Need an HTTP server, plus handling for reordering/dedup | Already built — no server needed |
+| Ordering | **Not guaranteed** (verified) | Guaranteed — `FETCH NEXT` returns commit order |
+| Resume after an outage | Backoff retry from RisingWave's memory; untested how it behaves across a RisingWave restart mid-backlog | Solved: on-disk `Checkpoint` + `SINCE <ts>`, bounded by the subscription's `retention` window |
+| Visibility into lag | None — a request either arrives or doesn't | `rw_timestamp` on every row |
+| Latency | Lower (push as soon as committed) | Bounded by `fetch_timeout_seconds` (default 5s) |
+| New failure surface | A whole HTTP server to run/secure/monitor | None — reuses the already-validated TCP client |
+
+**Verdict for this app:** keep polling. The HTTP sink is a reasonable
+choice if a consumer can tolerate reordering and dedupe independently,
+and lower latency matters more than strict ordering — but that's a
+different set of guarantees than what `RisingWave.Consumer` was built
+to preserve.
 
 ## Related documentation
 

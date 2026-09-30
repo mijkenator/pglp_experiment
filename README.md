@@ -153,20 +153,31 @@ Inserts/updates/deletes on `items` in Postgres show up in RisingWave's
 `items` within a couple of seconds. The RisingWave dashboard is at
 <http://localhost:5691>.
 
-## RisingWave sink (pushing data back to Postgres)
+## RisingWave sinks (pushing data back out)
 
-RisingWave can also push data the other way — `CREATE SINK ...
-connector='postgres'` — using ordinary DML over a JDBC connection pool
-it manages internally, not the replication protocol in either
-direction. Nothing in this repo wires this up automatically; see
-[`docs/risingwave-sink.md`](docs/risingwave-sink.md) for a full
-walkthrough, the correct `WITH (...)` property names (several public
-docs describe different names than what the server actually accepts —
-confirmed by iterating on the server's own error messages), and an
-important correctness gotcha: an `append-only` sink from a table that
-supports updates/deletes silently drops `DELETE`s and converts
-`UPDATE`s into extra `INSERT`s unless you understand what
-`force_append_only='true'` actually does.
+RisingWave can also push data the other way. Nothing in this repo
+wires either of these up automatically; see
+[`docs/risingwave-sink.md`](docs/risingwave-sink.md) for the full
+details:
+
+- **`CREATE SINK ... connector='postgres'`** — ordinary DML over a
+  JDBC connection pool RisingWave manages internally, not the
+  replication protocol in either direction. Covers the correct `WITH
+  (...)` property names (several public docs describe different names
+  than what the server actually accepts — confirmed by iterating on
+  the server's own error messages) and an important correctness
+  gotcha: an `append-only` sink from a table that supports
+  updates/deletes silently drops `DELETE`s and converts `UPDATE`s into
+  extra `INSERT`s unless you understand what `force_append_only='true'`
+  actually does.
+- **`CREATE SINK ... connector='http'`** — a genuine push mechanism
+  (RisingWave POSTs each row to a URL), evaluated as a possible
+  alternative to `RisingWave.Consumer`'s poll loop. Verified live that
+  it retries with backoff on delivery failure, but does **not**
+  guarantee delivery order — confirmed rows arriving out of order —
+  which conflicts with `Consumer`'s reliance on strict ordering for
+  `UpdateDelete`/`UpdateInsert` pairs. Kept the poll-based consumer for
+  this reason; see the doc for the full comparison.
 
 ## RisingWave consumer (experimental second CDC path)
 

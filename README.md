@@ -153,6 +153,21 @@ Inserts/updates/deletes on `items` in Postgres show up in RisingWave's
 `items` within a couple of seconds. The RisingWave dashboard is at
 <http://localhost:5691>.
 
+## RisingWave sink (pushing data back to Postgres)
+
+RisingWave can also push data the other way — `CREATE SINK ...
+connector='postgres'` — using ordinary DML over a JDBC connection pool
+it manages internally, not the replication protocol in either
+direction. Nothing in this repo wires this up automatically; see
+[`docs/risingwave-sink.md`](docs/risingwave-sink.md) for a full
+walkthrough, the correct `WITH (...)` property names (several public
+docs describe different names than what the server actually accepts —
+confirmed by iterating on the server's own error messages), and an
+important correctness gotcha: an `append-only` sink from a table that
+supports updates/deletes silently drops `DELETE`s and converts
+`UPDATE`s into extra `INSERT`s unless you understand what
+`force_append_only='true'` actually does.
+
 ## RisingWave consumer (experimental second CDC path)
 
 The section above shows the Elixir app's `Consumer` reading from

@@ -153,6 +153,52 @@ Inserts/updates/deletes on `items` in Postgres show up in RisingWave's
 `items` within a couple of seconds. The RisingWave dashboard is at
 <http://localhost:5691>.
 
+## RisingWave sinks (pushing data back out)
+
+RisingWave can also push data the other way. See
+[`docs/risingwave-sink.md`](docs/risingwave-sink.md) for the full
+details:
+
+- **`CREATE SINK ... connector='postgres'`** — ordinary DML over a
+  JDBC connection pool RisingWave manages internally, not the
+  replication protocol in either direction. Covers the correct `WITH
+  (...)` property names (several public docs describe different names
+  than what the server actually accepts — confirmed by iterating on
+  the server's own error messages) and an important correctness
+  gotcha: an `append-only` sink from a table that supports
+  updates/deletes silently drops `DELETE`s and converts `UPDATE`s into
+  extra `INSERT`s unless you understand what `force_append_only='true'`
+  actually does. Set up manually against `docker-compose`, not wired
+  into any mix task.
+- **`CREATE SINK ... connector='http'`** — a genuine push mechanism
+  (RisingWave POSTs each row to a URL), evaluated as a possible
+  alternative to `RisingWave.Consumer`'s poll loop. Verified live that
+  it retries with backoff on delivery failure, but does **not**
+  guarantee delivery order — confirmed rows arriving out of order —
+  which conflicts with `Consumer`'s reliance on strict ordering for
+  `UpdateDelete`/`UpdateInsert` pairs. Kept the poll-based consumer for
+  this reason; see the doc for the full comparison. Also set up
+  manually, not wired into any mix task.
+- **`CREATE SINK ... connector='mqtt'`** — tested as a possible "best
+  of both": a real pub/sub protocol with QoS semantics, pushed into an
+  MQTT broker *embedded directly in this Elixir app*
+  (`PglpExperiment.Mqtt.Broker`, via the `mqttx` library) — no separate
+  broker service to run, unlike Kafka. Verified live: it does **not**
+  solve the ordering problem either (RisingWave dispatches from ~17
+  parallel compute actors with no ordering coordination between them,
+  regardless of the push protocol underneath), and throughput lands in
+  the same range as the HTTP sink (no batching lever). Unlike the
+  Postgres/HTTP sinks, this one *is* wired into a mix task:
+
+  ```
+  docker compose up -d
+  mix pglp.risingwave &   # mirrors `items` into RisingWave first (needed as the sink's source)
+  mix pglp.mqtt           # starts the embedded broker + creates the sink
+  ```
+
+  In another shell, `./scripts/generate_events.sh 5 1` — publishes
+  should appear as log lines on the `pglp/items` topic.
+
 ## RisingWave consumer (experimental second CDC path)
 
 The section above shows the Elixir app's `Consumer` reading from
@@ -315,3 +361,16 @@ docker-compose's network):
 | `RW_PG_PASSWORD`               | `postgres`                  |
 | `RW_PG_DATABASE`               | `pglp_dev`                  |
 | `RW_PG_TABLE`                  | `public.items`               |
+
+`mix pglp.mqtt` reads its own set (nested under `:mqtt`), with a third
+network hop on top of the two above: how *RisingWave's sink* reaches
+back into this app's embedded MQTT broker:
+
+| Env var                | Default                              |
+|-------------------------|----------------------------------------|
+| `MQTT_BROKER_PORT`     | `1883`                                 |
+| `MQTT_SINK_URL`        | `tcp://host.docker.internal:1883`      |
+| `MQTT_SINK_NAME`       | `pglp_mqtt_sink`                       |
+| `MQTT_TOPIC`           | `pglp/items`                           |
+| `MQTT_QOS`             | `at_least_once`                        |
+| `MQTT_SOURCE_TABLE`    | `items`                                |

@@ -21,7 +21,10 @@ defmodule PglpExperiment.MixProject do
   defp deps do
     [
       {:postgrex, "~> 0.19"},
-      {:telemetry, "~> 1.0"}
+      {:telemetry, "~> 1.0"},
+      {:mqttx, "~> 0.11"},
+      {:thousand_island, "~> 1.0"},
+      {:jason, "~> 1.4"}
     ]
   end
 end

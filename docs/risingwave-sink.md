@@ -18,9 +18,12 @@ data paths already documented in this repo:
   conceptually, but has real correctness sharp edges (see below) that
   the other two don't.
 
-Nothing in this repo currently wires this up automatically — the
-findings below come from manually creating sinks against the running
-`docker-compose` stack and are recorded here for reference.
+A fourth path, MQTT, is also covered further below — unlike the
+Postgres/HTTP/Kafka sections, it's wired up by `mix pglp.mqtt` (see
+`PglpExperiment.Mqtt.Broker`/`PglpExperiment.Mqtt.SinkSetup`); the
+Postgres and HTTP sinks below were set up manually against the running
+`docker-compose` stack and are recorded here for reference, same as
+Kafka's desk evaluation (never stood up against a real broker).
 
 ## Postgres sink
 
@@ -412,6 +415,147 @@ throughput, decoupling latency against a real broker) before treating
 the Kafka-specific claims above as confirmed the way the rest of this
 document's findings — which *were* verified against the running
 stack — are.
+
+## The MQTT sink — tested as a "best of both" candidate; it isn't
+
+The Kafka section above is a desk evaluation (never stood up against a
+real broker). This section is the opposite: a real experiment, fully
+verified against the running `docker-compose` stack, testing whether
+`connector = 'mqtt'` could get Kafka's ordering guarantee *and* the HTTP
+sink's "zero extra infrastructure" property at once — by embedding the
+MQTT broker directly inside this Elixir app (via the
+[`mqttx`](https://hex.pm/packages/mqttx) library) rather than running a
+separate broker service. Elixir is the broker; RisingWave's sink is the
+client connecting *into* it — the same "no new service to operate"
+shape as the HTTP sink, but with a real pub/sub protocol and QoS
+semantics instead of one POST per row.
+
+See `PglpExperiment.Mqtt.Broker` and `PglpExperiment.Mqtt.SinkSetup`
+(new `lib/pglp_experiment/mqtt/` subsystem — not under `rising_wave/`,
+since the connection direction is inverted here: every `rising_wave/*`
+module has Elixir dialing *out* to RisingWave, whereas here RisingWave
+dials *into* Elixir) and `mix pglp.mqtt`.
+
+### Setup
+
+```sql
+CREATE SINK pglp_mqtt_sink FROM items WITH (
+  connector = 'mqtt',
+  url = 'tcp://host.docker.internal:1883',
+  topic = 'pglp/items',
+  qos = 'at_least_once',
+  type = 'append-only'
+)
+FORMAT PLAIN ENCODE JSON (force_append_only='true');
+```
+
+Unlike every other RisingWave connector tested in this repo's history
+(Postgres sink, HTTP sink, the `postgres-cdc` source), **every property
+name here worked on the first attempt** — `url`, `topic`, `qos`,
+`type` all matched the public docs exactly, no `missing field`
+iteration needed. The MQTT sink requires a `payload` concept the same
+way the HTTP sink does — plain `FORMAT PLAIN ENCODE JSON` with
+`force_append_only='true'` publishes each row as a JSON object to the
+configured topic.
+
+`host.docker.internal` also resolved cleanly from inside the RisingWave
+container on this (Docker Desktop / macOS) setup — no repeat of the
+HTTP sink investigation's container-to-host DNS failure. This isn't
+guaranteed on every Docker setup (that earlier failure was
+Linux-container-specific), so verify it on yours before assuming it
+"just works."
+
+### What was verified
+
+- **Full publish flow works correctly.** Five sequential rows generated
+  via `scripts/generate_events.sh 5 1` arrived at
+  `PglpExperiment.Mqtt.Broker.handle_publish/4` in order, with correct
+  JSON content, topic (`pglp/items`), and QoS (`1`).
+- **Ordering: MQTT does NOT solve the problem either.** Twenty rows
+  inserted in a single fast batch arrived completely out of order
+  (`12, 9, 7, 15, 6, 8, 13, 14, 23, 20, 17, 24, 11, 19, 10, 18, 21, 16,
+  22, 25` for ids `6..25`) — the same failure mode already confirmed
+  for the HTTP sink. The MQTT broker logged **~17 concurrent client
+  connections** from RisingWave (`risingwave_<n>_<generation>` client
+  IDs) during the test: RisingWave dispatches from multiple parallel
+  compute actors, each independently publishing whatever rows land in
+  its shard, with no ordering coordination between them — regardless of
+  which push protocol sits underneath. This is a property of
+  RisingWave's sink execution model, not of HTTP or MQTT specifically,
+  and nothing about MQTT's own ordering-within-a-topic semantics
+  changes it, because RisingWave itself is the one publishing
+  out of order.
+- **Outage/restart behavior: a full history replay, not just the
+  missed window.** Stopping `mix pglp.mqtt`, inserting 5 more rows
+  while it was down, then restarting it, redelivered **all 30 rows**
+  (the original 25 plus the 5 generated during the outage) — zero
+  gaps, but the entire history, not just what was missed. This is a
+  direct consequence of this repo's `DROP SINK` + `CREATE SINK`
+  idempotency pattern (`SinkSetup.ensure!/1`): since `CREATE SINK` has
+  no `IF NOT EXISTS`, every restart drops and recreates the sink from
+  scratch, and RisingWave treats a freshly created sink as having
+  nothing yet delivered — so it replays its entire buffered backlog
+  (see "Sink decoupling" above for why that backlog can hold
+  everything, unbounded by anything but storage). This is specific to
+  *this repo's* setup pattern, not an inherent MQTT sink property — a
+  sink that was never dropped/recreated would not have this behavior,
+  but RisingWave's own replay-on-fresh-sink semantics are real and
+  worth knowing either way.
+- **Throughput: in the same range as the HTTP sink, not the polling
+  consumer's batched throughput.** Measured ~1,388 messages/sec
+  draining a 5,000-row backlog — close to the HTTP sink's measured
+  ~1,250–1,365 rows/sec, nowhere near the polling consumer's `FETCH
+  1000` throughput (~89,285 rows/sec). Confirmed against RisingWave's
+  own MQTT connector docs: the full property list (`url`, `qos`,
+  `username`, `password`, `client_prefix`, `clean_start`,
+  `inflight_messages`, `tls.client_cert`, `tls.client_key`, `topic`,
+  `topic.field`, `retain`, `type`) has no batching, concurrency, or
+  connection-pool-size option — `inflight_messages` (default `100`)
+  caps concurrent *unacknowledged* QoS 1/2 messages, it doesn't batch
+  multiple rows into one publish. Same structural ceiling as the HTTP
+  sink: one row per network operation, permanently.
+
+### Infrastructure required: the one place MQTT delivers on its premise
+
+This is the actual hypothesis under test, and it did pan out: the
+embedded broker needed **zero separate services** — no broker process
+to run, monitor, or secure beyond the Elixir app itself, matching the
+HTTP sink's "RisingWave talks directly to our app" property and
+avoiding Kafka's "stand up and operate a whole broker" cost entirely.
+`{:mqttx, "~> 0.11"}` + `{:thousand_island, "~> 1.0"}` (the transport —
+not declared as a hard dependency by `mqttx` itself; compilation fails
+with `module ThousandIsland.Handler is not loaded` without adding it
+explicitly) were the only new pieces, both pure-Elixir libraries, no
+external process.
+
+So MQTT genuinely delivers on half the "best of both" hypothesis — no
+infrastructure cost beyond the HTTP sink's — but the other half
+(ordering) didn't pan out, because the ordering problem was never in
+the transport to begin with. It's in how RisingWave's sink executors
+dispatch rows across parallel actors, and that's unrelated to whether
+the wire protocol underneath is HTTP, MQTT, or anything else without
+its own partition/key-based ordering guarantee the way Kafka has.
+
+### Verdict
+
+**MQTT is not a "best of both" — it inherits the HTTP sink's ordering
+problem while adding genuine protocol complexity (QoS, topics, a new
+dependency) for no corresponding benefit in this evaluation.** If the
+goal is "push with zero extra infrastructure," the HTTP sink is simpler
+to reason about and already documented in detail above — MQTT doesn't
+improve on it here. If the goal is "guaranteed ordering," only Kafka's
+per-partition guarantee (unverified in this repo, but structurally
+real — see above) actually addresses it; embedding a broker instead of
+running one doesn't change *why* RisingWave's own dispatch reorders
+rows.
+
+The one scenario where this experiment's MQTT setup might still be
+worth it: a receiver that already needs MQTT's semantics for other
+reasons (retained messages, existing MQTT-based tooling, QoS-aware
+clients elsewhere in the system) and can tolerate reordering the same
+way an HTTP-sink receiver would have to. Absent that, prefer the HTTP
+sink for simplicity or Kafka for ordering — this experiment didn't find
+a reason to reach for MQTT over either.
 
 ## Related documentation
 

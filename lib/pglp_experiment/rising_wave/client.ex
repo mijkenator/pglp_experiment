@@ -21,8 +21,52 @@ defmodule PglpExperiment.RisingWave.Client do
       ERROR XX000 (internal_error): Failed to bind expression: t.typsend
         Item not found: missing FROM-clause entry for table "t"
 
+  Passing the undocumented `types: false` is a near-miss worth noting:
+  `Postgrex.Utils.default_opts/1` uses `Keyword.put_new` for the
+  `:types` default, so an explicit `false` (unlike `nil`, which trips
+  the `KeyError` above) survives as a "present but falsy" value —
+  which happens to satisfy the internal `types_key: if(types_mod, do:
+  ..., else: nil)` check the same way omitting bootstrapping does, so
+  `start_link/1` actually succeeds and skips the bootstrap query
+  entirely. But the connection is then unusable for any real query:
+  the default extended query protocol needs the (now-empty) type table
+  to `Describe` result column types and crashes with `** (FunctionClauseError)
+  no function clause matching in Postgrex.Types.fetch/2`; forcing the
+  simple protocol instead (`query_type: :text`) gets further but still
+  crashes decoding the result, since `Postgrex.Types.decode_simple/2`
+  unconditionally pattern-matches on a populated `{mod, table}` type
+  state — there's no partial/lazy mode. Every path through Postgrex
+  needs a populated type table before decoding anything, and the only
+  way to populate it is the bootstrap query RisingWave can't answer.
+
   This module talks the wire protocol directly and simply never sends
   that query — we control the entire handshake ourselves.
+
+  ## Why not the replication protocol (like `Replication.Consumer` uses)?
+
+  RisingWave speaks the Postgres *wire* protocol (the byte-level framing
+  this module implements) but not the Postgres *logical replication*
+  protocol — confirmed directly against a running container, over a
+  plain client connection:
+
+      => CREATE PUBLICATION test_pub FOR ALL TABLES;
+      ERROR: sql parser error: expected an object type after CREATE, found: PUBLICATION
+
+      => START_REPLICATION SLOT foo LOGICAL 0/0;
+      ERROR: sql parser error: expected statement, found: START_REPLICATION
+
+  RisingWave's SQL parser doesn't recognize either statement at all —
+  there's no publication concept, no replication slot, no
+  `pg_replication_slots` catalog, no `confirmed_flush_lsn`. None of the
+  server-side machinery `PglpExperiment.Replication.Consumer` relies on
+  exists here, so there was never a "just point the same consumer at a
+  different host" option. That's also why `RisingWave.Consumer`'s
+  resume model is fundamentally different (a client-supplied timestamp
+  via `DECLARE ... SINCE <ts>`, checkpointed to disk — see
+  `PglpExperiment.RisingWave.Checkpoint`) rather than an ack sent back
+  over this connection: the subscription protocol has no ack primitive
+  to send in the first place, and nothing about a cursor's position is
+  ever remembered server-side once the connection closes.
 
   ## Scope
 

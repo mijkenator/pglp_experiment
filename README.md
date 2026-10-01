@@ -157,7 +157,10 @@ Inserts/updates/deletes on `items` in Postgres show up in RisingWave's
 
 RisingWave can also push data the other way. See
 [`docs/risingwave-sink.md`](docs/risingwave-sink.md) for the full
-details:
+per-connector analysis, or
+[`docs/sink-comparison.md`](docs/sink-comparison.md) for a head-to-head
+comparison of HTTP sink vs MQTT sink vs polling on idempotency,
+performance, and scalability (all verified live, not theoretical):
 
 - **`CREATE SINK ... connector='postgres'`** — ordinary DML over a
   JDBC connection pool RisingWave manages internally, not the

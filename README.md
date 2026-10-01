@@ -282,6 +282,24 @@ outright in that case — logged as a warning, with a fallback to
 moduledoc on `PglpExperiment.RisingWave.Consumer` for the complete
 explanation.
 
+**Don't expect the same number of log lines as the Postgres consumer.**
+RisingWave materializes changes incrementally in epochs (its internal
+micro-batching interval) and the subscription only emits the *net*
+change per row per epoch — not necessarily every individual upstream
+WAL event. If an `INSERT` and a following `UPDATE` on the same row land
+close enough together (relative to that epoch interval) before
+RisingWave's CDC pipeline flushes, the intermediate `INSERT` is folded
+into the `UPDATE` before it ever reaches the subscription: you'll see
+only the `UpdateInsert` (or, if it also existed from a prior run,
+`UpdateDelete`+`UpdateInsert`), never a standalone `INSERT` line for
+that row. Run `./scripts/generate_events.sh 100 1` and watch — most
+insert+update pairs collapse into a single log line this way. This is
+expected, not a bug: `Replication.Consumer` reads Postgres's raw WAL
+directly and sees every statement, one-for-one; `RisingWave.Consumer`
+reads RisingWave's own subscription log, which reflects RisingWave's
+batching, not Postgres's. The two consumers are not expected to log the
+same number of lines for the same generator run.
+
 ## Performance testing
 
 `mix pglp.perf` measures how many replication events the consumer can

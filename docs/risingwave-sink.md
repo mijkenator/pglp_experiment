@@ -18,12 +18,15 @@ data paths already documented in this repo:
   conceptually, but has real correctness sharp edges (see below) that
   the other two don't.
 
-A fourth path, MQTT, is also covered further below — unlike the
-Postgres/HTTP/Kafka sections, it's wired up by `mix pglp.mqtt` (see
-`PglpExperiment.Mqtt.Broker`/`PglpExperiment.Mqtt.SinkSetup`); the
-Postgres and HTTP sinks below were set up manually against the running
-`docker-compose` stack and are recorded here for reference, same as
-Kafka's desk evaluation (never stood up against a real broker).
+A fourth path, MQTT, is also covered further below, wired up by `mix
+pglp.mqtt` (see `PglpExperiment.Mqtt.Broker`/`PglpExperiment.Mqtt.SinkSetup`).
+The HTTP sink section below also has a real wired-up implementation —
+`mix pglp.http` (see `PglpExperiment.Http.WebhookPlug`/`SinkSetup`) —
+re-verifying findings originally obtained with a throwaway Python
+listener. Only the Postgres sink (set up manually against the running
+`docker-compose` stack, recorded here for reference) and Kafka's desk
+evaluation (never stood up against a real broker) remain without a
+permanent implementation in this repo.
 
 ## Postgres sink
 
@@ -298,6 +301,84 @@ Combined with the reordering issue above, **polling scales better on
 every axis that matters here**: it has a real throughput lever the
 push mechanism lacks, and it preserves ordering, which the HTTP sink
 does not.
+
+### A real Elixir implementation (Bandit)
+
+Everything above was obtained with a throwaway Python `http.server`
+listener — useful for a quick finding, but not a permanent part of
+this repo. This subsection replaces that with a real, standing
+implementation: `PglpExperiment.Http.WebhookPlug` (a `Plug.Router`) +
+`PglpExperiment.Http.SinkSetup`, embedded via
+[Bandit](https://hex.pm/packages/bandit) and run via `mix pglp.http`.
+Bandit was chosen specifically because it builds on
+[`thousand_island`](https://hex.pm/packages/thousand_island), already
+a dependency here from the MQTT work (`PglpExperiment.Mqtt.Broker`'s
+transport) — so this reuses infrastructure already in the project
+rather than adding an unrelated HTTP server library.
+
+#### The `payload` view requirement
+
+RisingWave's HTTP sink needs a single `payload` column on its source —
+`items` has `id`/`name`/`updated_at`, not `payload`. Confirmed live
+that Postgres's whole-row-to-jsonb shortcut doesn't work on RisingWave:
+
+```sql
+-- Fails: "Item not found: Invalid column: items"
+CREATE VIEW http_src AS SELECT to_jsonb(items) AS payload FROM items;
+
+-- Works:
+CREATE VIEW http_src AS
+  SELECT jsonb_build_object('id', id, 'name', name, 'updated_at', updated_at) AS payload
+  FROM items;
+```
+
+Also confirmed: `CREATE OR REPLACE VIEW` is **not implemented**
+(`Feature is not yet implemented: CREATE OR REPLACE VIEW`), so —
+consistent with every other sink in this repo — idempotency is
+drop-then-create: `DROP VIEW IF EXISTS` (which does support `IF
+EXISTS`) followed by a fresh `CREATE VIEW`, and the same for the sink
+itself. `PglpExperiment.Http.SinkSetup.ensure!/1` automates both steps
+in this order: drop sink, drop view, create view, create sink — the
+sink depends on the view, so it must be dropped first and created
+last.
+
+#### Re-verified findings
+
+All three headline findings from the Python-listener investigation
+above were re-tested against this real implementation, with the same
+methodology used for the MQTT experiment:
+
+- **Ordering: reconfirmed unordered.** Twenty rows inserted in one fast
+  batch arrived at the real `WebhookPlug` as `15, 13, 14, 8, 9, 23, 16,
+  22, 17, 21, 25, 6, 12, 7, 10, 20, 11, 24, 18, 19` for ids `6..25` —
+  scrambled, same as the original Python-listener finding and the same
+  as MQTT's. All 25 rows arrived (zero gaps), just out of order. This
+  confirms the earlier finding wasn't an artifact of the throwaway
+  listener's own concurrency handling — the reordering is RisingWave's,
+  not the receiver's.
+- **Outage/restart: reconfirmed full-history replay.** Stopping `mix
+  pglp.http`, inserting 5 more rows while it was down, then restarting
+  it, redelivered **all 30 rows** (the original 25 plus the 5 generated
+  during the outage) — not just the missed window. Same cause as
+  MQTT's identical finding: `SinkSetup.ensure!/1`'s drop-then-create
+  pattern makes every restart look like a brand-new sink to RisingWave,
+  which replays its entire buffered backlog (see "Sink decoupling"
+  above for why that backlog can hold everything, unbounded by
+  anything but storage).
+- **Throughput: ~1,397 msgs/sec** draining a 5,000-row backlog —
+  consistent with both the original Python-listener figure
+  (~1,250–1,365 rows/sec) and MQTT's embedded-broker figure (~1,388
+  msgs/sec). All three land in the same tier because none of the three
+  transports (Python `http.server`, Bandit, `mqttx`) changes the
+  underlying constraint: RisingWave's HTTP sink connector has no
+  batching, concurrency, or connection-pool-size option (already
+  confirmed against its own docs above) — one row per request,
+  regardless of which HTTP server receives it.
+
+**This reconfirms, rather than overturns, the existing verdict**: keep
+polling for this app. A real embedded Elixir implementation changes
+nothing about the ordering or throughput ceiling — those are properties
+of RisingWave's sink execution model, not of the receiver.
 
 ## The Kafka sink — trades infrastructure for guaranteed ordering
 

@@ -172,13 +172,27 @@ details:
   into any mix task.
 - **`CREATE SINK ... connector='http'`** — a genuine push mechanism
   (RisingWave POSTs each row to a URL), evaluated as a possible
-  alternative to `RisingWave.Consumer`'s poll loop. Verified live that
+  alternative to `RisingWave.Consumer`'s poll loop. Verified live
+  (first with a throwaway Python listener, then re-confirmed against a
+  real embedded [Bandit](https://hex.pm/packages/bandit) server) that
   it retries with backoff on delivery failure, but does **not**
-  guarantee delivery order — confirmed rows arriving out of order —
-  which conflicts with `Consumer`'s reliance on strict ordering for
-  `UpdateDelete`/`UpdateInsert` pairs. Kept the poll-based consumer for
-  this reason; see the doc for the full comparison. Also set up
-  manually, not wired into any mix task.
+  guarantee delivery order — confirmed rows arriving out of order both
+  times — which conflicts with `Consumer`'s reliance on strict
+  ordering for `UpdateDelete`/`UpdateInsert` pairs. Kept the poll-based
+  consumer for this reason; see the doc for the full comparison. Like
+  the MQTT sink below, this *is* wired into a mix task
+  (`PglpExperiment.Http.WebhookPlug`/`SinkSetup`, chosen to build on
+  Bandit specifically because it uses `thousand_island`, already a dep
+  from the MQTT work):
+
+  ```
+  docker compose up -d
+  mix pglp.risingwave &   # mirrors `items` into RisingWave first (needed as the sink's source)
+  mix pglp.http           # starts the embedded Bandit server + creates the payload view + sink
+  ```
+
+  In another shell, `./scripts/generate_events.sh 5 1` — webhook POSTs
+  should appear as log lines.
 - **`CREATE SINK ... connector='mqtt'`** — tested as a possible "best
   of both": a real pub/sub protocol with QoS semantics, pushed into an
   MQTT broker *embedded directly in this Elixir app*
@@ -374,3 +388,16 @@ back into this app's embedded MQTT broker:
 | `MQTT_TOPIC`           | `pglp/items`                           |
 | `MQTT_QOS`             | `at_least_once`                        |
 | `MQTT_SOURCE_TABLE`    | `items`                                |
+
+`mix pglp.http` reads its own set (nested under `:http_sink`), same
+shape — how *RisingWave's HTTP sink* reaches back into this app's
+embedded Bandit server:
+
+| Env var                     | Default                                    |
+|------------------------------|--------------------------------------------|
+| `HTTP_SINK_PORT`            | `8080`                                      |
+| `HTTP_SINK_URL`             | `http://host.docker.internal:8080/webhook`  |
+| `HTTP_SINK_SINK_NAME`       | `pglp_http_sink`                            |
+| `HTTP_SINK_VIEW_NAME`       | `pglp_http_src`                             |
+| `HTTP_SINK_SOURCE_TABLE`    | `items`                                     |
+| `HTTP_SINK_COLUMNS`         | `id,name,updated_at`                        |

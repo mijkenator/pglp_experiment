@@ -62,3 +62,34 @@ config :pglp_experiment, :mqtt,
   rw_database: System.get_env("RW_DATABASE", "dev"),
   rw_username: System.get_env("RW_USER", "root"),
   rw_password: System.get_env("RW_PASSWORD", "")
+
+# RisingWave -> Elixir push experiment (mix pglp.http): the app embeds a
+# Bandit HTTP server (PglpExperiment.Http.WebhookPlug) and RisingWave's
+# own `connector = 'http'` sink POSTs INTO it -- same inverted direction
+# as :mqtt above. This re-verifies docs/risingwave-sink.md's existing
+# HTTP sink findings (ordering, outage/restart, throughput) against a
+# real Elixir receiver instead of the throwaway Python listener used
+# for the original investigation.
+#
+# RisingWave's HTTP sink requires a single `payload` column on its
+# source -- :source_table (e.g. `items`) doesn't have one, so
+# PglpExperiment.Http.SinkSetup first creates a view wrapping it into
+# the right shape (:view_name, built from :columns via
+# jsonb_build_object -- confirmed live that Postgres-style to_jsonb(row)
+# doesn't work on RisingWave).
+#
+# HTTP_SINK_PORT is where *our* server listens. HTTP_SINK_URL is how
+# *RisingWave's sink* reaches back to it -- same host.docker.internal
+# network hop already confirmed working for :mqtt above.
+config :pglp_experiment, :http_sink,
+  server_port: String.to_integer(System.get_env("HTTP_SINK_PORT", "8080")),
+  sink_url: System.get_env("HTTP_SINK_URL", "http://host.docker.internal:8080/webhook"),
+  sink_name: System.get_env("HTTP_SINK_SINK_NAME", "pglp_http_sink"),
+  view_name: System.get_env("HTTP_SINK_VIEW_NAME", "pglp_http_src"),
+  source_table: System.get_env("HTTP_SINK_SOURCE_TABLE", "items"),
+  columns: System.get_env("HTTP_SINK_COLUMNS", "id,name,updated_at") |> String.split(","),
+  rw_hostname: System.get_env("RW_HOST", "localhost"),
+  rw_port: String.to_integer(System.get_env("RW_PORT", "4566")),
+  rw_database: System.get_env("RW_DATABASE", "dev"),
+  rw_username: System.get_env("RW_USER", "root"),
+  rw_password: System.get_env("RW_PASSWORD", "")

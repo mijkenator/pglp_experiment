@@ -24,7 +24,8 @@ defmodule PglpExperiment.MixProject do
       {:telemetry, "~> 1.0"},
       {:mqttx, "~> 0.11"},
       {:thousand_island, "~> 1.0"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:bandit, "~> 1.0"}
     ]
   end
 end

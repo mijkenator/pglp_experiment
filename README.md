@@ -226,6 +226,9 @@ consuming *from* RisingWave, via RisingWave's own
 feature (`CREATE SUBSCRIPTION` + `DECLARE ... SUBSCRIPTION CURSOR` +
 `FETCH NEXT ... WITH (timeout = ...)`).
 
+See [`docs/risingwave-consumer.md`](docs/risingwave-consumer.md) for a
+full module-by-module walkthrough of how this is implemented.
+
 This can't use Postgrex — every Postgrex connection path unconditionally
 runs a `pg_type` bootstrap query that RisingWave's catalog can't satisfy
 (missing the `typsend` column it needs), which kills the connection
@@ -234,6 +237,50 @@ before any real query runs. See the moduledoc on
 `PglpExperiment.RisingWave.Client` is a small hand-rolled Postgres
 wire-protocol v3 client (`:gen_tcp`, zero extra deps) that skips that
 query entirely.
+
+### Why not just point `Replication.Consumer` at RisingWave?
+
+RisingWave speaks the Postgres **wire protocol** — the byte-level
+framing (startup handshake, simple query, etc.) — which is why
+`RisingWave.Client` can talk to it at all. But it does **not**
+implement Postgres's **logical replication protocol** on top of that
+wire — the specific commands `Replication.Consumer` depends on.
+Confirmed directly against a running RisingWave container, over a
+plain `psql` connection:
+
+```
+=> CREATE PUBLICATION test_pub FOR ALL TABLES;
+ERROR:  sql parser error: expected an object type after CREATE, found: PUBLICATION
+
+=> START_REPLICATION SLOT foo LOGICAL 0/0;
+ERROR:  sql parser error: expected statement, found: START_REPLICATION
+```
+
+RisingWave's SQL parser doesn't recognize either statement — it's not
+that it accepts them and behaves differently, it doesn't know what they
+are. There's no publication concept, no replication slot, no
+`pg_replication_slots` catalog, no `confirmed_flush_lsn` — none of the
+server-side machinery `Replication.Consumer` relies on exists in
+RisingWave. (The `pg_type` bootstrap failure above is actually the
+*first* wall Postgrex hits against RisingWave; even a client that
+skipped it, like ours, would still hit this second, more fundamental
+one.)
+
+This is also why RisingWave's resume model is fundamentally different
+from Postgres's — timestamp-based subscription cursors instead of a
+slot-tracked LSN — and why `RisingWave.Consumer` needed its own
+on-disk checkpoint (see below) rather than an ack-based scheme like
+`Replication.Consumer`'s: RisingWave's subscription protocol has no
+ack primitive to send in the first place. `DECLARE ... SUBSCRIPTION
+CURSOR ... SINCE <ts>` always starts a **new** cursor at a
+client-supplied timestamp; it never resumes "the same" cursor, and
+nothing about it is remembered server-side once the connection closes.
+RisingWave instead exposes its *own* mechanisms for exchanging data
+with Postgres-protocol clients — `CREATE SOURCE ...
+connector='postgres-cdc'` to consume replication *from* Postgres (see
+above), and `CREATE SUBSCRIPTION`/cursors to let clients consume
+*from* RisingWave — rather than exposing the wire-level replication
+protocol itself.
 
 `mix pglp.risingwave` automates the same `CREATE SOURCE`/`CREATE TABLE
 ... FROM ...`/`CREATE SUBSCRIPTION` steps the section above walks
